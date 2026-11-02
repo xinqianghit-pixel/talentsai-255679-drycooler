@@ -1,0 +1,9 @@
+{
+  "model": "DC-X480",
+  "design_air_tdb_c": 35.0,
+  "design_fluid_in_c": 45.0,
+  "design_fluid_out_c": 40.0,
+  "design_approach_k": 5.0,
+  "design_capacity_kw": 480.0,
+  "notes": "approach = design_fluid_out - design_air_tdb; dry cooler sensible only"
+}

@@ -1,0 +1,14 @@
+{
+  "tamb_c": 33.2,
+  "tdisch_c": 41.8,
+  "twb_c": 26.5,
+  "recirc_ratio": 0.22,
+  "fluid_in_c": 44.6,
+  "fluid_out_c": 39.1,
+  "glycol_kg_s": 22.4,
+  "cp_j_per_kg_k": 3650.0,
+  "bms_duty_kw": 512.0,
+  "fan_pct": 100,
+  "wind_dir_deg": 168,
+  "comment": "south wind plume blow-back; bms_duty_kw lagged from previous hour"
+}
