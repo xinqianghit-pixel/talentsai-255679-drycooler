@@ -6,8 +6,8 @@ echo '{"reward": 0}' > "$REWARD_FILE"
 
 python3 << 'PYEOF'
 import json
+import math
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -16,6 +16,14 @@ DATA_PATH = Path("/app/yard_sensors.json")
 SPEC_PATH = Path("/app/nameplate.json")
 SRC_PATH = Path("/app/dry_cooler_cap.py")
 TOLERANCE = 0.001
+REQUIRED_SENSOR = (
+    "recirc_ratio",
+    "tamb_c",
+    "tdisch_c",
+    "fluid_in_c",
+    "glycol_kg_s",
+    "cp_j_per_kg_k",
+)
 
 
 def write_reward(value: float) -> None:
@@ -71,11 +79,21 @@ def wrong_buggy_baseline(s: dict, np: dict) -> dict:
     return {"t_air_eff_c": round(t_air, 2), "q_avail_kw": round(float(s["bms_duty_kw"]), 2)}
 
 
+def is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def close(a: dict, b: dict) -> bool:
     try:
         for k in ("t_air_eff_c", "q_avail_kw"):
+            if k not in a or k not in b:
+                return False
+            if not is_number(a[k]) or not is_number(b[k]):
+                return False
             av = float(a[k])
             bv = float(b[k])
+            if not math.isfinite(av) or not math.isfinite(bv):
+                return False
             if abs(av - bv) > max(TOLERANCE * max(abs(bv), 1.0), 1e-6):
                 return False
         return True
@@ -83,15 +101,34 @@ def close(a: dict, b: dict) -> bool:
         return False
 
 
-def run_program():
+def parse_success_output(stdout: str):
+    lines = stdout.splitlines()
+    if len(lines) != 1:
+        return None
+    obj = json.loads(lines[0])
+    if not isinstance(obj, dict):
+        return None
+    for k in ("t_air_eff_c", "q_avail_kw"):
+        if k not in obj or not is_number(obj[k]) or not math.isfinite(float(obj[k])):
+            return None
+    return obj
+
+
+def run_raw(timeout: float = 30):
     try:
-        run = subprocess.run(
+        return subprocess.run(
             ["python3", "/app/dry_cooler_cap.py"],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
+        return None
+
+
+def run_program():
+    run = run_raw()
+    if run is None:
         print("FAIL: program timed out")
         return None
     if run.returncode != 0:
@@ -99,11 +136,31 @@ def run_program():
         print(run.stderr[:400])
         return None
     try:
-        return json.loads(run.stdout.strip().splitlines()[-1])
+        obj = parse_success_output(run.stdout)
     except Exception as exc:
         print(f"FAIL: bad json ({exc})")
         print(run.stdout[:200])
         return None
+    if obj is None:
+        print("FAIL: stdout must be exactly one JSON object line with finite numbers")
+        print(run.stdout[:200])
+        return None
+    return obj
+
+
+def expect_reject(label: str, timeout: float = 10) -> bool:
+    run = run_raw(timeout=timeout)
+    if run is None:
+        print(f"FAIL [{label}]: timed out (timeout is not accept)")
+        return False
+    if run.returncode == 0:
+        print(f"FAIL [{label}]: expected non-zero exit, got 0; stdout={run.stdout[:120]!r}")
+        return False
+    if not (run.stderr or "").strip():
+        print(f"FAIL [{label}]: expected stderr error message")
+        return False
+    print(f"PASS [{label}]")
+    return True
 
 
 def backup() -> tuple:
@@ -120,7 +177,7 @@ def mutate_and_check(mutator, label: str) -> bool:
     try:
         s = load_json(DATA_PATH)
         np = load_json(SPEC_PATH)
-        s2, np2 = mutator(s, np)
+        s2, np2 = mutator(dict(s), dict(np))
         DATA_PATH.write_text(json.dumps(s2, ensure_ascii=False, indent=2), encoding="utf-8")
         SPEC_PATH.write_text(json.dumps(np2, ensure_ascii=False, indent=2), encoding="utf-8")
         got = run_program()
@@ -133,6 +190,19 @@ def mutate_and_check(mutator, label: str) -> bool:
             return False
         print(f"PASS [{label}]")
         return True
+    finally:
+        restore(data_txt, spec_txt)
+
+
+def mutate_and_reject(mutator, label: str) -> bool:
+    data_txt, spec_txt = backup()
+    try:
+        s = load_json(DATA_PATH)
+        np = load_json(SPEC_PATH)
+        s2, np2 = mutator(dict(s), dict(np))
+        DATA_PATH.write_text(json.dumps(s2, ensure_ascii=False, indent=2), encoding="utf-8")
+        SPEC_PATH.write_text(json.dumps(np2, ensure_ascii=False, indent=2), encoding="utf-8")
+        return expect_reject(label)
     finally:
         restore(data_txt, spec_txt)
 
@@ -150,7 +220,6 @@ try:
     else:
         print("PASS [A baseline]")
 
-    # Reject common wrong answers on baseline
     if got0 is not None:
         for name, fn in [
             ("wetbulb", wrong_wetbulb),
@@ -163,102 +232,128 @@ try:
                 print(f"FAIL: output matches wrong_{name} {w}")
                 all_ok = False
 
-    # Case B: change recirculation ratio
-    def mut_r(s, np):
-        s = dict(s)
-        s["recirc_ratio"] = 0.45
-        return s, np
-
-    if not mutate_and_check(mut_r, "B recirc"):
+    # Case B-E: independent / combined mutations that must track
+    if not mutate_and_check(lambda s, np: (s | {"recirc_ratio": 0.45}, np), "B recirc"):
+        all_ok = False
+    if not mutate_and_check(lambda s, np: (s, np | {"design_approach_k": 6.5}), "C approach"):
+        all_ok = False
+    if not mutate_and_check(
+        lambda s, np: (s | {"glycol_kg_s": float(s["glycol_kg_s"]) * 1.15}, np), "D flow"
+    ):
+        all_ok = False
+    if not mutate_and_check(
+        lambda s, np: (s | {"tamb_c": 30.0, "tdisch_c": 39.0, "fluid_in_c": 46.0}, np), "E temps"
+    ):
         all_ok = False
 
-    # Case C: change approach in nameplate
-    def mut_a(s, np):
-        np = dict(np)
-        np["design_approach_k"] = 6.5
-        return s, np
-
-    if not mutate_and_check(mut_a, "C approach"):
+    # Independent temperature / cp tracking
+    if not mutate_and_check(lambda s, np: (s | {"tamb_c": 31.0}, np), "H tamb only"):
+        all_ok = False
+    if not mutate_and_check(lambda s, np: (s | {"tdisch_c": 43.0}, np), "I tdisch only"):
+        all_ok = False
+    if not mutate_and_check(lambda s, np: (s | {"fluid_in_c": 46.5}, np), "J fluid_in only"):
+        all_ok = False
+    if not mutate_and_check(lambda s, np: (s | {"cp_j_per_kg_k": 3900.0}, np), "K cp only"):
         all_ok = False
 
-    # Case D: scale flow
-    def mut_m(s, np):
-        s = dict(s)
-        s["glycol_kg_s"] = float(s["glycol_kg_s"]) * 1.15
-        return s, np
-
-    if not mutate_and_check(mut_m, "D flow"):
+    # Legal boundary ratios 0 and 1 (keep available dT strictly positive)
+    if not mutate_and_check(lambda s, np: (s | {"recirc_ratio": 0.0}, np), "L ratio 0"):
+        all_ok = False
+    if not mutate_and_check(
+        lambda s, np: (s | {"recirc_ratio": 1.0, "fluid_in_c": 50.0}, np), "M ratio 1"
+    ):
         all_ok = False
 
-    # Case E: rewrite temperatures
-    def mut_t(s, np):
-        s = dict(s)
-        s["tamb_c"] = 30.0
-        s["tdisch_c"] = 39.0
-        s["fluid_in_c"] = 46.0
-        return s, np
-
-    if not mutate_and_check(mut_t, "E temps"):
+    # Distractor fields must not affect answer
+    if not mutate_and_check(lambda s, np: (s | {"twb_c": 10.0, "bms_duty_kw": 1.0, "fluid_out_c": 0.0}, np), "N distractors changed"):
         all_ok = False
 
-    # Case F: non-positive dT should fail (crash/nonzero or clearly not success json of positive Q)
     data_txt, spec_txt = backup()
     try:
         s = load_json(DATA_PATH)
-        s["fluid_in_c"] = 20.0  # too cold vs air+approach
+        for key in ("twb_c", "bms_duty_kw", "fluid_out_c"):
+            s.pop(key, None)
         DATA_PATH.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
-        try:
-            run = subprocess.run(
-                ["python3", "/app/dry_cooler_cap.py"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except subprocess.TimeoutExpired:
-            print("PASS [F non-positive dT]: timed out treated as reject")
+        got = run_program()
+        if got is None or not close(got, exp0):
+            print(f"FAIL [O distractors removed]: expected {exp0}, got {got}")
+            all_ok = False
         else:
-            ok_reject = run.returncode != 0
-            if run.returncode == 0:
-                try:
-                    obj = json.loads(run.stdout.strip().splitlines()[-1])
-                    # Accept only if it did not emit a plausible positive available duty
-                    ok_reject = float(obj.get("q_avail_kw", 1)) <= 0
-                except Exception:
-                    ok_reject = True
-            if ok_reject:
-                print("PASS [F non-positive dT]")
-            else:
-                print("FAIL [F non-positive dT]: should reject")
-                all_ok = False
+            print("PASS [O distractors removed]")
     finally:
         restore(data_txt, spec_txt)
 
-    # Case G: invalid recirc_ratio
-    data_txt, spec_txt = backup()
-    try:
-        s = load_json(DATA_PATH)
-        s["recirc_ratio"] = 1.5
-        DATA_PATH.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
-        try:
-            run = subprocess.run(
-                ["python3", "/app/dry_cooler_cap.py"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except subprocess.TimeoutExpired:
-            print("PASS [G bad ratio]: timed out treated as reject")
-        else:
-            if run.returncode != 0:
-                print("PASS [G bad ratio]")
-            else:
-                print("FAIL [G bad ratio]: should reject")
-                all_ok = False
-    finally:
-        restore(data_txt, spec_txt)
+    # Reject cases: non-positive dT (<0 and ==0), bad ratios, missing fields, non-finite/non-positive params
+    if not mutate_and_reject(lambda s, np: (s | {"fluid_in_c": 20.0}, np), "F dT < 0"):
+        all_ok = False
 
-    # Anti-cheat: ensure source still present and not a trivial constant printer
+    def mut_dT0(s, np):
+        # Binary-exact values make dT == 0 unambiguous across implementations.
+        return (
+            s | {"recirc_ratio": 0.5, "tamb_c": 30.0, "tdisch_c": 40.0, "fluid_in_c": 40.0},
+            np | {"design_approach_k": 5.0},
+        )
+
+    if not mutate_and_reject(mut_dT0, "F2 dT == 0"):
+        all_ok = False
+    if not mutate_and_reject(lambda s, np: (s | {"recirc_ratio": 1.5}, np), "G ratio > 1"):
+        all_ok = False
+    if not mutate_and_reject(lambda s, np: (s | {"recirc_ratio": -0.1}, np), "G2 ratio < 0"):
+        all_ok = False
+    if not mutate_and_reject(lambda s, np: (s | {"recirc_ratio": 1.1}, np), "G3 ratio 1.1"):
+        all_ok = False
+    if not mutate_and_reject(lambda s, np: (s | {"glycol_kg_s": 0.0}, np), "P zero flow"):
+        all_ok = False
+    if not mutate_and_reject(lambda s, np: (s | {"glycol_kg_s": -1.0}, np), "P2 negative flow"):
+        all_ok = False
+    if not mutate_and_reject(lambda s, np: (s | {"cp_j_per_kg_k": 0.0}, np), "Q zero cp"):
+        all_ok = False
+    if not mutate_and_reject(lambda s, np: (s | {"cp_j_per_kg_k": float("nan")}, np), "Q2 nan cp"):
+        all_ok = False
+    if not mutate_and_reject(lambda s, np: (s | {"cp_j_per_kg_k": -1.0}, np), "Q3 negative cp"):
+        all_ok = False
+
+    for key in REQUIRED_SENSOR:
+        def mut_missing(s, np, key=key):
+            s = dict(s)
+            s.pop(key, None)
+            return s, np
+
+        if not mutate_and_reject(mut_missing, f"R missing {key}"):
+            all_ok = False
+
+    def mut_missing_approach(s, np):
+        np.pop("design_approach_k", None)
+        return s, np
+
+    if not mutate_and_reject(mut_missing_approach, "S missing design_approach_k"):
+        all_ok = False
+
+    # Every required numeric field must preserve the input contract, even when
+    # a candidate silently substitutes a plausible finite default for bad data.
+    for side, keys in (("sensor", REQUIRED_SENSOR), ("nameplate", ("design_approach_k",))):
+        for key in keys:
+            for kind, value in (
+                ("NaN", float("nan")),
+                ("Infinity", float("inf")),
+                ("-Infinity", -float("inf")),
+                ("bool", True),
+                ("string", "35.0"),
+                ("null", None),
+            ):
+                def mut_bad_number(s, np, side=side, key=key, value=value):
+                    target = s if side == "sensor" else np
+                    target[key] = value
+                    return s, np
+
+                if not mutate_and_reject(mut_bad_number, f"T invalid {side}.{key} {kind}"):
+                    all_ok = False
+
+    # Anti-cheat: source must mention recirculation path, not BMS-only
     src = SRC_PATH.read_text(encoding="utf-8")
+    if "recirc_ratio" not in src:
+        print("FAIL: source does not reference recirc_ratio")
+        all_ok = False
     if "bms_duty_kw" in src and "recirc_ratio" not in src:
         print("FAIL: source still looks like BMS-only path without recirculation")
         all_ok = False

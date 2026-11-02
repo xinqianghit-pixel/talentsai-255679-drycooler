@@ -32,11 +32,13 @@ python3 /app/dry_cooler_cap.py
   \]
   其中 \(\dot m\)、\(c_p\)、\(T_{fluid,in}\) 来自工况，\(A_{des}\) 来自铭牌；
 - 乙二醇侧实测热负荷仅作核对参考，不得用 `bms_duty_kw` 充当 `q_avail_kw`；
-- `recirc_ratio` 越界、有效温差非正、或缺少必要字段时应拒绝；输入变化时输出必须随之变化。
+- 必要字段：工况中的 `recirc_ratio`、`tamb_c`、`tdisch_c`、`fluid_in_c`、`glycol_kg_s`、`cp_j_per_kg_k`，以及铭牌中的 `design_approach_k`。这些字段须为有限的 JSON number，布尔值、数字字符串与 `null` 均不作为数值接受；缺少字段时须报错，不得以默认值代替；
+- `recirc_ratio` 必须在 \([0,1]\)；有效温差必须严格为正；`glycol_kg_s` 与 `cp_j_per_kg_k` 必须为正有限数；缺少必要字段、非有限数值或上述越界条件须非零退出，并向 stderr 给出错误说明；超时视为失败；
+- `twb_c`、`bms_duty_kw`、`fluid_out_c` 等干扰字段不得参与可用排热计算；输入变化时输出必须随之变化。
 
 ## 期望输出
 
-向 stdout 打印一行 JSON（相对误差允许 0.1%）：
+向 stdout **只打印一行** JSON（相对误差允许 0.1%；数值须为有限 JSON number，禁止 `NaN`/`Infinity`）：
 
 ```json
 {"t_air_eff_c": <number>, "q_avail_kw": <number>}
