@@ -1,7 +1,7 @@
 schema_version = "1.3"
 
 [task]
-name = "heatcore/drycooler-yard-recirc"
+name = "heatcore/drycooler-yard-recirc-multiunit"
 authors = [{ name = "xinqiang", email = "noreply@example.com" }]
 
 [agent]

@@ -1,8 +1,7 @@
 # 参考解说明
 
-1. 用 `recirc_ratio` 将 `tamb_c` 与 `tdisch_c` 掺混得到有效进风干球，禁用 `twb_c`。
-2. 乙二醇侧显热上限：`m*cp*(fluid_in - t_air_eff - design_approach_k)/1000`，单位 kW。
-3. 读取铭牌 `capacity_curve`，按有效进风线性插值（端点夹取），得到铭牌能力。
-4. 最终 `q_avail_kw = min(乙二醇显热上限, 曲线能力)`；不要用 `bms_duty_kw` / 单独 `design_capacity_kw`。
-5. 校验：`r∈[0,1]`、必要字段存在、曲线点合法且横坐标严格递增、`m>0`、`cp>0`、全部有限、有效温差严格为正；失败时非零退出并写 stderr。
-6. stdout 仅一行 `json.dumps(..., allow_nan=False)`。
+1. 解析 `units` 与方阵 `recirc_matrix`；校验唯一 id、机型、行和 < 1、非负矩阵元。
+2. `t_eff[i] = (1-sum(row_i))*tamb + sum_j(row_i[j]*tdisch[j])`。
+3. 用主动集/水填充把 `glycol_total_kg_s` 按 `valve_weight` 分配，触顶截断并再分配。
+4. 每机 `q = min(m*cp*dT/1000, curve_interp(model))`；`q_site = sum(q)`。
+5. 输出顺序与输入 units 一致；内部不提前 round；stdout 仅一行 `allow_nan=False` JSON。

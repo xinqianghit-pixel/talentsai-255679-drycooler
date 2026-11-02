@@ -1,15 +1,24 @@
 {
-  "model": "DC-X480",
-  "design_air_tdb_c": 35.0,
-  "design_fluid_in_c": 45.0,
-  "design_fluid_out_c": 40.0,
   "design_approach_k": 5.0,
-  "design_capacity_kw": 480.0,
-  "capacity_curve": [
-    {"t_air_eff_c": 25.0, "q_cap_kw": 480.0},
-    {"t_air_eff_c": 30.0, "q_cap_kw": 420.0},
-    {"t_air_eff_c": 35.0, "q_cap_kw": 360.0},
-    {"t_air_eff_c": 40.0, "q_cap_kw": 300.0}
-  ],
-  "notes": "approach = design_fluid_out - design_air_tdb; capacity_curve is air-side derate vs effective inlet dry-bulb; dry cooler sensible only"
+  "models": {
+    "DC-X480": {
+      "design_capacity_kw": 480.0,
+      "capacity_curve": [
+        {"t_air_eff_c": 25.0, "q_cap_kw": 480.0},
+        {"t_air_eff_c": 30.0, "q_cap_kw": 420.0},
+        {"t_air_eff_c": 35.0, "q_cap_kw": 360.0},
+        {"t_air_eff_c": 40.0, "q_cap_kw": 300.0}
+      ]
+    },
+    "DC-Y300": {
+      "design_capacity_kw": 360.0,
+      "capacity_curve": [
+        {"t_air_eff_c": 25.0, "q_cap_kw": 360.0},
+        {"t_air_eff_c": 30.0, "q_cap_kw": 300.0},
+        {"t_air_eff_c": 35.0, "q_cap_kw": 250.0},
+        {"t_air_eff_c": 40.0, "q_cap_kw": 200.0}
+      ]
+    }
+  },
+  "notes": "approach shared; capacity_curve is air-side derate vs effective inlet dry-bulb; dry cooler sensible only"
 }

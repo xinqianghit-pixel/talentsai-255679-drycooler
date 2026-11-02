@@ -1,10 +1,11 @@
 #!/bin/bash
-# Harbor verifier for dry-cooler recirculation capacity
+# Harbor verifier: multi-unit dry-cooler cross-recirc + shared glycol active-set
 REWARD_FILE="/logs/verifier/reward.json"
 mkdir -p /logs/verifier
 echo '{"reward": 0}' > "$REWARD_FILE"
 
 python3 << 'PYEOF'
+import copy
 import json
 import math
 import os
@@ -16,15 +17,8 @@ DATA_PATH = Path("/app/yard_sensors.json")
 SPEC_PATH = Path("/app/nameplate.json")
 SRC_PATH = Path("/app/dry_cooler_cap.py")
 TOLERANCE = 0.001
-REQUIRED_SENSOR = (
-    "recirc_ratio",
-    "tamb_c",
-    "tdisch_c",
-    "fluid_in_c",
-    "glycol_kg_s",
-    "cp_j_per_kg_k",
-)
-REQUIRED_SPEC = ("design_approach_k", "capacity_curve")
+FLOW_TOL = 1e-9
+MAX_FLOW_ITERS = 64
 
 
 def write_reward(value: float) -> None:
@@ -47,19 +41,19 @@ def load_json(path: Path) -> dict:
     return obj
 
 
+def is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def parse_capacity_curve(raw) -> list:
-    if not isinstance(raw, list) or len(raw) < 2:
-        raise ValueError("bad capacity_curve")
-    points = []
-    for item in raw:
-        points.append((float(item["t_air_eff_c"]), float(item["q_cap_kw"])))
+    points = [(float(p["t_air_eff_c"]), float(p["q_cap_kw"])) for p in raw]
     for i in range(1, len(points)):
         if not (points[i][0] > points[i - 1][0]):
-            raise ValueError("capacity_curve not strictly increasing")
+            raise ValueError("curve not increasing")
     return points
 
 
-def interpolate_capacity(points: list, t_eff: float) -> float:
+def interpolate_capacity(points, t_eff: float) -> float:
     if t_eff <= points[0][0]:
         return points[0][1]
     if t_eff >= points[-1][0]:
@@ -68,83 +62,97 @@ def interpolate_capacity(points: list, t_eff: float) -> float:
         if t0 <= t_eff <= t1:
             w = (t_eff - t0) / (t1 - t0)
             return q0 + w * (q1 - q0)
-    raise ValueError("interpolate failed")
+    raise ValueError("interp fail")
+
+
+def allocate_flows(total: float, weights: list[float], caps: list[float]) -> list[float]:
+    n = len(weights)
+    remaining = float(total)
+    out = [0.0] * n
+    active = {i for i in range(n) if weights[i] > 0.0 and caps[i] > 0.0}
+    for _ in range(MAX_FLOW_ITERS):
+        if remaining <= FLOW_TOL or not active:
+            break
+        wsum = sum(weights[i] for i in active)
+        if wsum <= 0.0:
+            break
+        provisional = {i: remaining * (weights[i] / wsum) for i in active}
+        saturated = [
+            i for i, share in provisional.items() if share >= (caps[i] - out[i]) - FLOW_TOL
+        ]
+        if saturated:
+            for i in saturated:
+                out[i] = caps[i]
+                active.discard(i)
+            remaining = total - sum(out)
+            continue
+        for i, share in provisional.items():
+            out[i] += share
+        remaining = 0.0
+        break
+    return out
 
 
 def expected_from(s: dict, np: dict) -> dict:
-    r = float(s["recirc_ratio"])
-    t_eff = (1.0 - r) * float(s["tamb_c"]) + r * float(s["tdisch_c"])
-    dT = float(s["fluid_in_c"]) - t_eff - float(np["design_approach_k"])
-    q_gly = float(s["glycol_kg_s"]) * float(s["cp_j_per_kg_k"]) * dT / 1000.0
-    q_curve = interpolate_capacity(parse_capacity_curve(np["capacity_curve"]), t_eff)
-    q_kw = min(q_gly, q_curve)
-    return {"t_air_eff_c": round(t_eff, 2), "q_avail_kw": round(q_kw, 2)}
+    tamb = float(s["tamb_c"])
+    total = float(s["glycol_total_kg_s"])
+    cp = float(s["cp_j_per_kg_k"])
+    approach = float(np["design_approach_k"])
+    models = {
+        mid: parse_capacity_curve(m["capacity_curve"]) for mid, m in np["models"].items()
+    }
+    units = s["units"]
+    n = len(units)
+    matrix = s["recirc_matrix"]
+    tdisch = [float(u["tdisch_c"]) for u in units]
+    fluid_in = [float(u["fluid_in_c"]) for u in units]
+    weights = [float(u["valve_weight"]) for u in units]
+    caps = [float(u["max_flow_kg_s"]) for u in units]
+    flows = allocate_flows(total, weights, caps)
+    out_units = []
+    q_site = 0.0
+    for i, u in enumerate(units):
+        row = [float(x) for x in matrix[i]]
+        row_sum = sum(row)
+        t_eff = (1.0 - row_sum) * tamb + sum(row[j] * tdisch[j] for j in range(n))
+        dT = fluid_in[i] - t_eff - approach
+        q_gly = flows[i] * cp * dT / 1000.0
+        q_curve = interpolate_capacity(models[u["model_id"]], t_eff)
+        q_avail = min(q_gly, q_curve)
+        q_site += q_avail
+        out_units.append(
+            {
+                "id": u["id"],
+                "t_air_eff_c": round(t_eff, 2),
+                "flow_kg_s": round(flows[i], 2),
+                "q_avail_kw": round(q_avail, 2),
+            }
+        )
+    return {"q_site_kw": round(q_site, 2), "units": out_units}
 
 
-def wrong_wetbulb(s: dict, np: dict) -> dict:
-    t_air = float(s["twb_c"])
-    dT = float(s["fluid_in_c"]) - t_air - float(np["design_approach_k"])
-    q_kw = float(s["glycol_kg_s"]) * float(s["cp_j_per_kg_k"]) * dT / 1000.0
-    return {"t_air_eff_c": round(t_air, 2), "q_avail_kw": round(q_kw, 2)}
-
-
-def wrong_ambient_only(s: dict, np: dict) -> dict:
-    t_air = float(s["tamb_c"])
-    dT = float(s["fluid_in_c"]) - t_air - float(np["design_approach_k"])
-    q_kw = float(s["glycol_kg_s"]) * float(s["cp_j_per_kg_k"]) * dT / 1000.0
-    return {"t_air_eff_c": round(t_air, 2), "q_avail_kw": round(q_kw, 2)}
-
-
-def wrong_bms(s: dict, np: dict) -> dict:
-    r = float(s["recirc_ratio"])
-    t_eff = (1.0 - r) * float(s["tamb_c"]) + r * float(s["tdisch_c"])
-    return {"t_air_eff_c": round(t_eff, 2), "q_avail_kw": round(float(s["bms_duty_kw"]), 2)}
-
-
-def wrong_buggy_baseline(s: dict, np: dict) -> dict:
-    t_air = float(s["twb_c"])
-    return {"t_air_eff_c": round(t_air, 2), "q_avail_kw": round(float(s["bms_duty_kw"]), 2)}
-
-
-def wrong_glycol_only(s: dict, np: dict) -> dict:
-    """Pre-P1 formula: mix + glycol sensible, ignore capacity_curve."""
-    r = float(s["recirc_ratio"])
-    t_eff = (1.0 - r) * float(s["tamb_c"]) + r * float(s["tdisch_c"])
-    dT = float(s["fluid_in_c"]) - t_eff - float(np["design_approach_k"])
-    q_kw = float(s["glycol_kg_s"]) * float(s["cp_j_per_kg_k"]) * dT / 1000.0
-    return {"t_air_eff_c": round(t_eff, 2), "q_avail_kw": round(q_kw, 2)}
-
-
-def wrong_curve_only(s: dict, np: dict) -> dict:
-    r = float(s["recirc_ratio"])
-    t_eff = (1.0 - r) * float(s["tamb_c"]) + r * float(s["tdisch_c"])
-    q_kw = interpolate_capacity(parse_capacity_curve(np["capacity_curve"]), t_eff)
-    return {"t_air_eff_c": round(t_eff, 2), "q_avail_kw": round(q_kw, 2)}
-
-
-def wrong_design_cap(s: dict, np: dict) -> dict:
-    r = float(s["recirc_ratio"])
-    t_eff = (1.0 - r) * float(s["tamb_c"]) + r * float(s["tdisch_c"])
-    return {"t_air_eff_c": round(t_eff, 2), "q_avail_kw": round(float(np["design_capacity_kw"]), 2)}
-
-
-def is_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+def close_num(a, b) -> bool:
+    if not is_number(a) or not is_number(b):
+        return False
+    av, bv = float(a), float(b)
+    if not math.isfinite(av) or not math.isfinite(bv):
+        return False
+    return abs(av - bv) <= max(TOLERANCE * max(abs(bv), 1.0), 1e-6)
 
 
 def close(a: dict, b: dict) -> bool:
     try:
-        for k in ("t_air_eff_c", "q_avail_kw"):
-            if k not in a or k not in b:
+        if not close_num(a.get("q_site_kw"), b.get("q_site_kw")):
+            return False
+        ua, ub = a.get("units"), b.get("units")
+        if not isinstance(ua, list) or not isinstance(ub, list) or len(ua) != len(ub):
+            return False
+        for x, y in zip(ua, ub):
+            if x.get("id") != y.get("id"):
                 return False
-            if not is_number(a[k]) or not is_number(b[k]):
-                return False
-            av = float(a[k])
-            bv = float(b[k])
-            if not math.isfinite(av) or not math.isfinite(bv):
-                return False
-            if abs(av - bv) > max(TOLERANCE * max(abs(bv), 1.0), 1e-6):
-                return False
+            for k in ("t_air_eff_c", "flow_kg_s", "q_avail_kw"):
+                if not close_num(x.get(k), y.get(k)):
+                    return False
         return True
     except Exception:
         return False
@@ -155,11 +163,18 @@ def parse_success_output(stdout: str):
     if len(lines) != 1:
         return None
     obj = json.loads(lines[0])
-    if not isinstance(obj, dict):
+    if not isinstance(obj, dict) or "q_site_kw" not in obj or "units" not in obj:
         return None
-    for k in ("t_air_eff_c", "q_avail_kw"):
-        if k not in obj or not is_number(obj[k]) or not math.isfinite(float(obj[k])):
+    if not is_number(obj["q_site_kw"]) or not math.isfinite(float(obj["q_site_kw"])):
+        return None
+    if not isinstance(obj["units"], list):
+        return None
+    for u in obj["units"]:
+        if not isinstance(u, dict) or "id" not in u:
             return None
+        for k in ("t_air_eff_c", "flow_kg_s", "q_avail_kw"):
+            if k not in u or not is_number(u[k]) or not math.isfinite(float(u[k])):
+                return None
     return obj
 
 
@@ -188,10 +203,9 @@ def run_program():
         obj = parse_success_output(run.stdout)
     except Exception as exc:
         print(f"FAIL: bad json ({exc})")
-        print(run.stdout[:200])
         return None
     if obj is None:
-        print("FAIL: stdout must be exactly one JSON object line with finite numbers")
+        print("FAIL: stdout must be exactly one JSON object line")
         print(run.stdout[:200])
         return None
     return obj
@@ -200,23 +214,23 @@ def run_program():
 def expect_reject(label: str, timeout: float = 10) -> bool:
     run = run_raw(timeout=timeout)
     if run is None:
-        print(f"FAIL [{label}]: timed out (timeout is not accept)")
+        print(f"FAIL [{label}]: timed out")
         return False
     if run.returncode == 0:
-        print(f"FAIL [{label}]: expected non-zero exit, got 0; stdout={run.stdout[:120]!r}")
+        print(f"FAIL [{label}]: expected non-zero exit")
         return False
     if not (run.stderr or "").strip():
-        print(f"FAIL [{label}]: expected stderr error message")
+        print(f"FAIL [{label}]: expected stderr")
         return False
     print(f"PASS [{label}]")
     return True
 
 
-def backup() -> tuple:
+def backup():
     return DATA_PATH.read_text(encoding="utf-8"), SPEC_PATH.read_text(encoding="utf-8")
 
 
-def restore(data_txt: str, spec_txt: str) -> None:
+def restore(data_txt, spec_txt):
     DATA_PATH.write_text(data_txt, encoding="utf-8")
     SPEC_PATH.write_text(spec_txt, encoding="utf-8")
 
@@ -224,9 +238,8 @@ def restore(data_txt: str, spec_txt: str) -> None:
 def mutate_and_check(mutator, label: str) -> bool:
     data_txt, spec_txt = backup()
     try:
-        s = load_json(DATA_PATH)
-        np = load_json(SPEC_PATH)
-        s2, np2 = mutator(dict(s), dict(np))
+        s, np = load_json(DATA_PATH), load_json(SPEC_PATH)
+        s2, np2 = mutator(copy.deepcopy(s), copy.deepcopy(np))
         DATA_PATH.write_text(json.dumps(s2, ensure_ascii=False, indent=2), encoding="utf-8")
         SPEC_PATH.write_text(json.dumps(np2, ensure_ascii=False, indent=2), encoding="utf-8")
         got = run_program()
@@ -246,9 +259,8 @@ def mutate_and_check(mutator, label: str) -> bool:
 def mutate_and_reject(mutator, label: str) -> bool:
     data_txt, spec_txt = backup()
     try:
-        s = load_json(DATA_PATH)
-        np = load_json(SPEC_PATH)
-        s2, np2 = mutator(dict(s), dict(np))
+        s, np = load_json(DATA_PATH), load_json(SPEC_PATH)
+        s2, np2 = mutator(copy.deepcopy(s), copy.deepcopy(np))
         DATA_PATH.write_text(json.dumps(s2, ensure_ascii=False, indent=2), encoding="utf-8")
         SPEC_PATH.write_text(json.dumps(np2, ensure_ascii=False, indent=2), encoding="utf-8")
         return expect_reject(label)
@@ -258,7 +270,6 @@ def mutate_and_reject(mutator, label: str) -> bool:
 
 all_ok = True
 try:
-    # Case A: baseline
     s0 = load_json(DATA_PATH)
     np0 = load_json(SPEC_PATH)
     exp0 = expected_from(s0, np0)
@@ -269,227 +280,222 @@ try:
     else:
         print("PASS [A baseline]")
 
+    # Wrong paths that ignore matrix / active-set / curve
     if got0 is not None:
-        for name, fn in [
-            ("wetbulb", wrong_wetbulb),
-            ("ambient", wrong_ambient_only),
-            ("bms", wrong_bms),
-            ("baseline-bug", wrong_buggy_baseline),
-            ("glycol-only", wrong_glycol_only),
-            ("curve-only", wrong_curve_only),
-            ("design-cap", wrong_design_cap),
-        ]:
-            w = fn(s0, np0)
-            if close(got0, w) and not close(w, exp0):
-                print(f"FAIL: output matches wrong_{name} {w}")
-                all_ok = False
+        wrong_equal = copy.deepcopy(exp0)
+        n = len(s0["units"])
+        share = float(s0["glycol_total_kg_s"]) / n
+        for u in wrong_equal["units"]:
+            u["flow_kg_s"] = round(share, 2)
+        if close(got0, wrong_equal) and not close(wrong_equal, exp0):
+            print("FAIL: matches equal-split flow path")
+            all_ok = False
 
-    # Case B-E: independent / combined mutations that must track
-    if not mutate_and_check(lambda s, np: (s | {"recirc_ratio": 0.45}, np), "B recirc"):
-        all_ok = False
-    if not mutate_and_check(lambda s, np: (s, np | {"design_approach_k": 6.5}), "C approach"):
-        all_ok = False
-    def mut_flow_glycol_limited(s, np):
-        # Ensure glycol path is active so flow tracking is observable under min().
-        curve = [
-            {"t_air_eff_c": 20.0, "q_cap_kw": 900.0},
-            {"t_air_eff_c": 45.0, "q_cap_kw": 800.0},
-        ]
-        return s | {"glycol_kg_s": float(s["glycol_kg_s"]) * 1.15}, np | {"capacity_curve": curve}
+    # Matrix direction: transpose must change answer
+    def mut_transpose(s, np):
+        m = s["recirc_matrix"]
+        s["recirc_matrix"] = [[m[j][i] for j in range(len(m))] for i in range(len(m))]
+        # keep row sums < 1 by scaling if needed
+        for i, row in enumerate(s["recirc_matrix"]):
+            rs = sum(row)
+            if rs >= 1.0:
+                s["recirc_matrix"][i] = [x * 0.4 for x in row]
+        return s, np
 
-    if not mutate_and_check(mut_flow_glycol_limited, "D flow"):
-        all_ok = False
-    if not mutate_and_check(
-        lambda s, np: (s | {"tamb_c": 30.0, "tdisch_c": 39.0, "fluid_in_c": 46.0}, np), "E temps"
-    ):
+    if not mutate_and_check(mut_transpose, "B matrix transpose"):
         all_ok = False
 
-    # Independent temperature / cp tracking
-    if not mutate_and_check(lambda s, np: (s | {"tamb_c": 31.0}, np), "H tamb only"):
-        all_ok = False
-    if not mutate_and_check(lambda s, np: (s | {"tdisch_c": 43.0}, np), "I tdisch only"):
-        all_ok = False
-    if not mutate_and_check(lambda s, np: (s | {"fluid_in_c": 46.5}, np), "J fluid_in only"):
-        all_ok = False
-    if not mutate_and_check(lambda s, np: (s | {"cp_j_per_kg_k": 3900.0}, np), "K cp only"):
-        all_ok = False
-
-    # Legal boundary ratios 0 and 1 (keep available dT strictly positive)
-    if not mutate_and_check(lambda s, np: (s | {"recirc_ratio": 0.0}, np), "L ratio 0"):
-        all_ok = False
-    if not mutate_and_check(
-        lambda s, np: (s | {"recirc_ratio": 1.0, "fluid_in_c": 50.0}, np), "M ratio 1"
-    ):
-        all_ok = False
-
-    # Curve mutations: shift plateaus / force clamp / force glycol-limited regime
-    def mut_curve_down(s, np):
-        curve = [
-            {"t_air_eff_c": 25.0, "q_cap_kw": 200.0},
-            {"t_air_eff_c": 30.0, "q_cap_kw": 180.0},
-            {"t_air_eff_c": 35.0, "q_cap_kw": 160.0},
-            {"t_air_eff_c": 40.0, "q_cap_kw": 140.0},
-        ]
-        return s, np | {"capacity_curve": curve}
-
-    if not mutate_and_check(mut_curve_down, "U curve derated"):
-        all_ok = False
-
-    def mut_curve_clamp_high(s, np):
-        # t_eff ~35 stays above rightmost point -> clamp to 250
-        curve = [
-            {"t_air_eff_c": 20.0, "q_cap_kw": 400.0},
-            {"t_air_eff_c": 25.0, "q_cap_kw": 300.0},
-            {"t_air_eff_c": 28.0, "q_cap_kw": 250.0},
-        ]
-        return s, np | {"capacity_curve": curve}
-
-    if not mutate_and_check(mut_curve_clamp_high, "U2 curve clamp high"):
-        all_ok = False
-
-    def mut_glycol_limited(s, np):
-        # Raise curve far above glycol so min() takes glycol path
-        curve = [
-            {"t_air_eff_c": 20.0, "q_cap_kw": 900.0},
-            {"t_air_eff_c": 45.0, "q_cap_kw": 800.0},
-        ]
-        return s, np | {"capacity_curve": curve}
-
-    if not mutate_and_check(mut_glycol_limited, "U3 glycol-limited regime"):
-        all_ok = False
-
-    # Distractor fields must not affect answer
+    # Active-set: tighten B cap so redistribution is forced differently
     if not mutate_and_check(
         lambda s, np: (
-            s | {"twb_c": 10.0, "bms_duty_kw": 1.0, "fluid_out_c": 0.0},
-            np | {"design_capacity_kw": 1.0},
+            s
+            | {
+                "units": [
+                    u | ({"max_flow_kg_s": 10.0} if u["id"] == "B" else {})
+                    for u in s["units"]
+                ]
+            },
+            np,
         ),
-        "N distractors changed",
+        "C active-set retighten B",
     ):
         all_ok = False
 
-    data_txt, spec_txt = backup()
-    try:
-        s = load_json(DATA_PATH)
-        for key in ("twb_c", "bms_duty_kw", "fluid_out_c"):
-            s.pop(key, None)
-        DATA_PATH.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
-        got = run_program()
-        if got is None or not close(got, exp0):
-            print(f"FAIL [O distractors removed]: expected {exp0}, got {got}")
-            all_ok = False
-        else:
-            print("PASS [O distractors removed]")
-    finally:
-        restore(data_txt, spec_txt)
+    # Model swap on unit A
+    if not mutate_and_check(
+        lambda s, np: (
+            s
+            | {
+                "units": [
+                    u | ({"model_id": "DC-Y300"} if u["id"] == "A" else {})
+                    for u in s["units"]
+                ]
+            },
+            np,
+        ),
+        "D swap model A",
+    ):
+        all_ok = False
 
-    # Reject cases: non-positive dT (<0 and ==0), bad ratios, missing fields, non-finite/non-positive params
-    if not mutate_and_reject(lambda s, np: (s | {"fluid_in_c": 20.0}, np), "F dT < 0"):
+    # Independent field tracking
+    if not mutate_and_check(lambda s, np: (s | {"tamb_c": 30.0}, np), "E tamb"):
+        all_ok = False
+    if not mutate_and_check(
+        lambda s, np: (
+            s
+            | {
+                "units": [
+                    u | ({"tdisch_c": 45.0} if u["id"] == "A" else {}) for u in s["units"]
+                ]
+            },
+            np,
+        ),
+        "F one discharge",
+    ):
+        all_ok = False
+    if not mutate_and_check(
+        lambda s, np: (
+            s
+            | {
+                "units": [
+                    u | ({"valve_weight": 2.0} if u["id"] == "C" else {}) for u in s["units"]
+                ]
+            },
+            np,
+        ),
+        "G valve weight",
+    ):
+        all_ok = False
+    if not mutate_and_check(lambda s, np: (s | {"glycol_total_kg_s": 50.0}, np), "H total flow"):
+        all_ok = False
+    if not mutate_and_check(lambda s, np: (s, np | {"design_approach_k": 6.0}), "I approach"):
+        all_ok = False
+
+    # Curve derate on one model
+    def mut_curve(s, np):
+        np = copy.deepcopy(np)
+        np["models"]["DC-Y300"]["capacity_curve"] = [
+            {"t_air_eff_c": 25.0, "q_cap_kw": 200.0},
+            {"t_air_eff_c": 40.0, "q_cap_kw": 120.0},
+        ]
+        return s, np
+
+    if not mutate_and_check(mut_curve, "J curve derate Y"):
+        all_ok = False
+
+    # Left clamp: force very low t_eff via low tamb + zero matrix
+    def mut_left_clamp(s, np):
+        n = len(s["units"])
+        s = s | {"tamb_c": 20.0, "recirc_matrix": [[0.0] * n for _ in range(n)]}
+        return s, np
+
+    if not mutate_and_check(mut_left_clamp, "K curve left clamp"):
+        all_ok = False
+
+    # Right clamp: force every effective inlet above the last curve point.
+    # This separates endpoint clamping from a tempting linear extrapolation.
+    def mut_right_clamp(s, np):
+        n = len(s["units"])
+        s = copy.deepcopy(s)
+        s["tamb_c"] = 45.0
+        s["recirc_matrix"] = [[0.0] * n for _ in range(n)]
+        for u in s["units"]:
+            u["fluid_in_c"] = 55.0
+        return s, np
+
+    if not mutate_and_check(mut_right_clamp, "K2 curve right clamp"):
+        all_ok = False
+
+    # Distractors changed must not affect
+    if not mutate_and_check(
+        lambda s, np: (
+            s
+            | {
+                "units": [
+                    u | {"twb_c": 1.0, "bms_duty_kw": 1.0, "fluid_out_c": 0.0} for u in s["units"]
+                ]
+            },
+            np,
+        ),
+        "L distractors",
+    ):
+        all_ok = False
+
+    # Rejects
+    if not mutate_and_reject(lambda s, np: (s | {"glycol_total_kg_s": 0.0}, np), "R zero total"):
+        all_ok = False
+    if not mutate_and_reject(lambda s, np: (s | {"cp_j_per_kg_k": -1.0}, np), "R2 neg cp"):
+        all_ok = False
+
+    def mut_row_sum(s, np):
+        s = copy.deepcopy(s)
+        s["recirc_matrix"][0] = [0.5, 0.5, 0.1]
+        return s, np
+
+    if not mutate_and_reject(mut_row_sum, "R3 row sum >=1"):
+        all_ok = False
+
+    def mut_neg_matrix(s, np):
+        s = copy.deepcopy(s)
+        s["recirc_matrix"][1][0] = -0.1
+        return s, np
+
+    if not mutate_and_reject(mut_neg_matrix, "R4 neg matrix"):
+        all_ok = False
+
+    def mut_dup_id(s, np):
+        s = copy.deepcopy(s)
+        s["units"][1]["id"] = s["units"][0]["id"]
+        return s, np
+
+    if not mutate_and_reject(mut_dup_id, "R5 dup id"):
+        all_ok = False
+
+    def mut_bad_model(s, np):
+        s = copy.deepcopy(s)
+        s["units"][0]["model_id"] = "NOPE"
+        return s, np
+
+    if not mutate_and_reject(mut_bad_model, "R6 unknown model"):
+        all_ok = False
+
+    def mut_non_square(s, np):
+        s = copy.deepcopy(s)
+        s["recirc_matrix"] = s["recirc_matrix"][:2]
+        return s, np
+
+    if not mutate_and_reject(mut_non_square, "R7 non square"):
         all_ok = False
 
     def mut_dT0(s, np):
-        # Binary-exact values make dT == 0 unambiguous across implementations.
-        return (
-            s | {"recirc_ratio": 0.5, "tamb_c": 30.0, "tdisch_c": 40.0, "fluid_in_c": 40.0},
-            np | {"design_approach_k": 5.0},
-        )
+        s = copy.deepcopy(s)
+        n = len(s["units"])
+        s["tamb_c"] = 40.0
+        s["recirc_matrix"] = [[0.0] * n for _ in range(n)]
+        for u in s["units"]:
+            u["fluid_in_c"] = 45.0
+        return s, np | {"design_approach_k": 5.0}
 
-    if not mutate_and_reject(mut_dT0, "F2 dT == 0"):
-        all_ok = False
-    if not mutate_and_reject(lambda s, np: (s | {"recirc_ratio": 1.5}, np), "G ratio > 1"):
-        all_ok = False
-    if not mutate_and_reject(lambda s, np: (s | {"recirc_ratio": -0.1}, np), "G2 ratio < 0"):
-        all_ok = False
-    if not mutate_and_reject(lambda s, np: (s | {"recirc_ratio": 1.1}, np), "G3 ratio 1.1"):
-        all_ok = False
-    if not mutate_and_reject(lambda s, np: (s | {"glycol_kg_s": 0.0}, np), "P zero flow"):
-        all_ok = False
-    if not mutate_and_reject(lambda s, np: (s | {"glycol_kg_s": -1.0}, np), "P2 negative flow"):
-        all_ok = False
-    if not mutate_and_reject(lambda s, np: (s | {"cp_j_per_kg_k": 0.0}, np), "Q zero cp"):
-        all_ok = False
-    if not mutate_and_reject(lambda s, np: (s | {"cp_j_per_kg_k": float("nan")}, np), "Q2 nan cp"):
-        all_ok = False
-    if not mutate_and_reject(lambda s, np: (s | {"cp_j_per_kg_k": -1.0}, np), "Q3 negative cp"):
+    if not mutate_and_reject(mut_dT0, "R8 dT==0"):
         all_ok = False
 
-    for key in REQUIRED_SENSOR:
-        def mut_missing(s, np, key=key):
-            s = dict(s)
-            s.pop(key, None)
-            return s, np
+    def mut_curve_one(s, np):
+        np = copy.deepcopy(np)
+        np["models"]["DC-X480"]["capacity_curve"] = [{"t_air_eff_c": 30.0, "q_cap_kw": 400.0}]
+        return s, np
 
-        if not mutate_and_reject(mut_missing, f"R missing {key}"):
-            all_ok = False
-
-    for key in REQUIRED_SPEC:
-        def mut_missing_spec(s, np, key=key):
-            np = dict(np)
-            np.pop(key, None)
-            return s, np
-
-        if not mutate_and_reject(mut_missing_spec, f"S missing {key}"):
-            all_ok = False
-
-    def mut_curve_one_point(s, np):
-        return s, np | {"capacity_curve": [{"t_air_eff_c": 30.0, "q_cap_kw": 400.0}]}
-
-    if not mutate_and_reject(mut_curve_one_point, "S2 curve < 2 points"):
+    if not mutate_and_reject(mut_curve_one, "R9 curve <2"):
         all_ok = False
 
-    def mut_curve_nonincreasing(s, np):
-        return s, np | {
-            "capacity_curve": [
-                {"t_air_eff_c": 30.0, "q_cap_kw": 400.0},
-                {"t_air_eff_c": 30.0, "q_cap_kw": 350.0},
-            ]
-        }
+    for key in ("tamb_c", "glycol_total_kg_s", "cp_j_per_kg_k"):
+        for kind, value in (("NaN", float("nan")), ("bool", True), ("null", None), ("str", "1.0")):
+            def mut(s, np, key=key, value=value):
+                s = copy.deepcopy(s)
+                s[key] = value
+                return s, np
 
-    if not mutate_and_reject(mut_curve_nonincreasing, "S3 curve not increasing"):
-        all_ok = False
-
-    def mut_curve_bad_point(s, np):
-        return s, np | {
-            "capacity_curve": [
-                {"t_air_eff_c": 25.0, "q_cap_kw": 400.0},
-                {"t_air_eff_c": 35.0},
-            ]
-        }
-
-    if not mutate_and_reject(mut_curve_bad_point, "S4 curve point missing q"):
-        all_ok = False
-
-    # Every required numeric field must preserve the input contract, even when
-    # a candidate silently substitutes a plausible finite default for bad data.
-    for side, keys in (("sensor", REQUIRED_SENSOR), ("nameplate", ("design_approach_k",))):
-        for key in keys:
-            for kind, value in (
-                ("NaN", float("nan")),
-                ("Infinity", float("inf")),
-                ("-Infinity", -float("inf")),
-                ("bool", True),
-                ("string", "35.0"),
-                ("null", None),
-            ):
-                def mut_bad_number(s, np, side=side, key=key, value=value):
-                    target = s if side == "sensor" else np
-                    target[key] = value
-                    return s, np
-
-                if not mutate_and_reject(mut_bad_number, f"T invalid {side}.{key} {kind}"):
-                    all_ok = False
-
-    # Anti-cheat: source must mention recirculation + curve path, not BMS-only
-    src = SRC_PATH.read_text(encoding="utf-8")
-    if "recirc_ratio" not in src:
-        print("FAIL: source does not reference recirc_ratio")
-        all_ok = False
-    if "capacity_curve" not in src:
-        print("FAIL: source does not reference capacity_curve")
-        all_ok = False
-    if "bms_duty_kw" in src and "recirc_ratio" not in src:
-        print("FAIL: source still looks like BMS-only path without recirculation")
-        all_ok = False
+            if not mutate_and_reject(mut, f"T {key} {kind}"):
+                all_ok = False
 
     write_reward(1.0 if all_ok else 0.0)
 except Exception as exc:

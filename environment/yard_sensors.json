@@ -1,14 +1,43 @@
 {
   "tamb_c": 33.2,
-  "tdisch_c": 41.8,
-  "twb_c": 26.5,
-  "recirc_ratio": 0.22,
-  "fluid_in_c": 44.6,
-  "fluid_out_c": 39.1,
-  "glycol_kg_s": 22.4,
+  "glycol_total_kg_s": 60.0,
   "cp_j_per_kg_k": 3650.0,
-  "bms_duty_kw": 512.0,
-  "fan_pct": 100,
-  "wind_dir_deg": 168,
-  "comment": "south wind plume blow-back; bms_duty_kw lagged from previous hour"
+  "recirc_matrix": [
+    [0.05, 0.10, 0.05],
+    [0.15, 0.00, 0.10],
+    [0.08, 0.12, 0.00]
+  ],
+  "units": [
+    {
+      "id": "A",
+      "tdisch_c": 41.8,
+      "fluid_in_c": 44.6,
+      "valve_weight": 1.0,
+      "max_flow_kg_s": 25.0,
+      "model_id": "DC-X480",
+      "twb_c": 26.5,
+      "bms_duty_kw": 512.0
+    },
+    {
+      "id": "B",
+      "tdisch_c": 40.0,
+      "fluid_in_c": 45.0,
+      "valve_weight": 1.0,
+      "max_flow_kg_s": 22.0,
+      "model_id": "DC-Y300",
+      "twb_c": 25.1,
+      "bms_duty_kw": 480.0
+    },
+    {
+      "id": "C",
+      "tdisch_c": 42.5,
+      "fluid_in_c": 46.0,
+      "valve_weight": 0.5,
+      "max_flow_kg_s": 18.0,
+      "model_id": "DC-X480",
+      "fluid_out_c": 39.0,
+      "bms_duty_kw": 390.0
+    }
+  ],
+  "comment": "asymmetric plume cross-recirc; station glycol shared; bms_duty_kw lagged"
 }
