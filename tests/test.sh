@@ -24,6 +24,7 @@ REQUIRED_SENSOR = (
     "glycol_kg_s",
     "cp_j_per_kg_k",
 )
+REQUIRED_SPEC = ("design_approach_k", "capacity_curve")
 
 
 def write_reward(value: float) -> None:
@@ -46,11 +47,37 @@ def load_json(path: Path) -> dict:
     return obj
 
 
+def parse_capacity_curve(raw) -> list:
+    if not isinstance(raw, list) or len(raw) < 2:
+        raise ValueError("bad capacity_curve")
+    points = []
+    for item in raw:
+        points.append((float(item["t_air_eff_c"]), float(item["q_cap_kw"])))
+    for i in range(1, len(points)):
+        if not (points[i][0] > points[i - 1][0]):
+            raise ValueError("capacity_curve not strictly increasing")
+    return points
+
+
+def interpolate_capacity(points: list, t_eff: float) -> float:
+    if t_eff <= points[0][0]:
+        return points[0][1]
+    if t_eff >= points[-1][0]:
+        return points[-1][1]
+    for (t0, q0), (t1, q1) in zip(points, points[1:]):
+        if t0 <= t_eff <= t1:
+            w = (t_eff - t0) / (t1 - t0)
+            return q0 + w * (q1 - q0)
+    raise ValueError("interpolate failed")
+
+
 def expected_from(s: dict, np: dict) -> dict:
     r = float(s["recirc_ratio"])
     t_eff = (1.0 - r) * float(s["tamb_c"]) + r * float(s["tdisch_c"])
     dT = float(s["fluid_in_c"]) - t_eff - float(np["design_approach_k"])
-    q_kw = float(s["glycol_kg_s"]) * float(s["cp_j_per_kg_k"]) * dT / 1000.0
+    q_gly = float(s["glycol_kg_s"]) * float(s["cp_j_per_kg_k"]) * dT / 1000.0
+    q_curve = interpolate_capacity(parse_capacity_curve(np["capacity_curve"]), t_eff)
+    q_kw = min(q_gly, q_curve)
     return {"t_air_eff_c": round(t_eff, 2), "q_avail_kw": round(q_kw, 2)}
 
 
@@ -77,6 +104,28 @@ def wrong_bms(s: dict, np: dict) -> dict:
 def wrong_buggy_baseline(s: dict, np: dict) -> dict:
     t_air = float(s["twb_c"])
     return {"t_air_eff_c": round(t_air, 2), "q_avail_kw": round(float(s["bms_duty_kw"]), 2)}
+
+
+def wrong_glycol_only(s: dict, np: dict) -> dict:
+    """Pre-P1 formula: mix + glycol sensible, ignore capacity_curve."""
+    r = float(s["recirc_ratio"])
+    t_eff = (1.0 - r) * float(s["tamb_c"]) + r * float(s["tdisch_c"])
+    dT = float(s["fluid_in_c"]) - t_eff - float(np["design_approach_k"])
+    q_kw = float(s["glycol_kg_s"]) * float(s["cp_j_per_kg_k"]) * dT / 1000.0
+    return {"t_air_eff_c": round(t_eff, 2), "q_avail_kw": round(q_kw, 2)}
+
+
+def wrong_curve_only(s: dict, np: dict) -> dict:
+    r = float(s["recirc_ratio"])
+    t_eff = (1.0 - r) * float(s["tamb_c"]) + r * float(s["tdisch_c"])
+    q_kw = interpolate_capacity(parse_capacity_curve(np["capacity_curve"]), t_eff)
+    return {"t_air_eff_c": round(t_eff, 2), "q_avail_kw": round(q_kw, 2)}
+
+
+def wrong_design_cap(s: dict, np: dict) -> dict:
+    r = float(s["recirc_ratio"])
+    t_eff = (1.0 - r) * float(s["tamb_c"]) + r * float(s["tdisch_c"])
+    return {"t_air_eff_c": round(t_eff, 2), "q_avail_kw": round(float(np["design_capacity_kw"]), 2)}
 
 
 def is_number(value) -> bool:
@@ -226,6 +275,9 @@ try:
             ("ambient", wrong_ambient_only),
             ("bms", wrong_bms),
             ("baseline-bug", wrong_buggy_baseline),
+            ("glycol-only", wrong_glycol_only),
+            ("curve-only", wrong_curve_only),
+            ("design-cap", wrong_design_cap),
         ]:
             w = fn(s0, np0)
             if close(got0, w) and not close(w, exp0):
@@ -237,9 +289,15 @@ try:
         all_ok = False
     if not mutate_and_check(lambda s, np: (s, np | {"design_approach_k": 6.5}), "C approach"):
         all_ok = False
-    if not mutate_and_check(
-        lambda s, np: (s | {"glycol_kg_s": float(s["glycol_kg_s"]) * 1.15}, np), "D flow"
-    ):
+    def mut_flow_glycol_limited(s, np):
+        # Ensure glycol path is active so flow tracking is observable under min().
+        curve = [
+            {"t_air_eff_c": 20.0, "q_cap_kw": 900.0},
+            {"t_air_eff_c": 45.0, "q_cap_kw": 800.0},
+        ]
+        return s | {"glycol_kg_s": float(s["glycol_kg_s"]) * 1.15}, np | {"capacity_curve": curve}
+
+    if not mutate_and_check(mut_flow_glycol_limited, "D flow"):
         all_ok = False
     if not mutate_and_check(
         lambda s, np: (s | {"tamb_c": 30.0, "tdisch_c": 39.0, "fluid_in_c": 46.0}, np), "E temps"
@@ -264,8 +322,50 @@ try:
     ):
         all_ok = False
 
+    # Curve mutations: shift plateaus / force clamp / force glycol-limited regime
+    def mut_curve_down(s, np):
+        curve = [
+            {"t_air_eff_c": 25.0, "q_cap_kw": 200.0},
+            {"t_air_eff_c": 30.0, "q_cap_kw": 180.0},
+            {"t_air_eff_c": 35.0, "q_cap_kw": 160.0},
+            {"t_air_eff_c": 40.0, "q_cap_kw": 140.0},
+        ]
+        return s, np | {"capacity_curve": curve}
+
+    if not mutate_and_check(mut_curve_down, "U curve derated"):
+        all_ok = False
+
+    def mut_curve_clamp_high(s, np):
+        # t_eff ~35 stays above rightmost point -> clamp to 250
+        curve = [
+            {"t_air_eff_c": 20.0, "q_cap_kw": 400.0},
+            {"t_air_eff_c": 25.0, "q_cap_kw": 300.0},
+            {"t_air_eff_c": 28.0, "q_cap_kw": 250.0},
+        ]
+        return s, np | {"capacity_curve": curve}
+
+    if not mutate_and_check(mut_curve_clamp_high, "U2 curve clamp high"):
+        all_ok = False
+
+    def mut_glycol_limited(s, np):
+        # Raise curve far above glycol so min() takes glycol path
+        curve = [
+            {"t_air_eff_c": 20.0, "q_cap_kw": 900.0},
+            {"t_air_eff_c": 45.0, "q_cap_kw": 800.0},
+        ]
+        return s, np | {"capacity_curve": curve}
+
+    if not mutate_and_check(mut_glycol_limited, "U3 glycol-limited regime"):
+        all_ok = False
+
     # Distractor fields must not affect answer
-    if not mutate_and_check(lambda s, np: (s | {"twb_c": 10.0, "bms_duty_kw": 1.0, "fluid_out_c": 0.0}, np), "N distractors changed"):
+    if not mutate_and_check(
+        lambda s, np: (
+            s | {"twb_c": 10.0, "bms_duty_kw": 1.0, "fluid_out_c": 0.0},
+            np | {"design_capacity_kw": 1.0},
+        ),
+        "N distractors changed",
+    ):
         all_ok = False
 
     data_txt, spec_txt = backup()
@@ -322,11 +422,41 @@ try:
         if not mutate_and_reject(mut_missing, f"R missing {key}"):
             all_ok = False
 
-    def mut_missing_approach(s, np):
-        np.pop("design_approach_k", None)
-        return s, np
+    for key in REQUIRED_SPEC:
+        def mut_missing_spec(s, np, key=key):
+            np = dict(np)
+            np.pop(key, None)
+            return s, np
 
-    if not mutate_and_reject(mut_missing_approach, "S missing design_approach_k"):
+        if not mutate_and_reject(mut_missing_spec, f"S missing {key}"):
+            all_ok = False
+
+    def mut_curve_one_point(s, np):
+        return s, np | {"capacity_curve": [{"t_air_eff_c": 30.0, "q_cap_kw": 400.0}]}
+
+    if not mutate_and_reject(mut_curve_one_point, "S2 curve < 2 points"):
+        all_ok = False
+
+    def mut_curve_nonincreasing(s, np):
+        return s, np | {
+            "capacity_curve": [
+                {"t_air_eff_c": 30.0, "q_cap_kw": 400.0},
+                {"t_air_eff_c": 30.0, "q_cap_kw": 350.0},
+            ]
+        }
+
+    if not mutate_and_reject(mut_curve_nonincreasing, "S3 curve not increasing"):
+        all_ok = False
+
+    def mut_curve_bad_point(s, np):
+        return s, np | {
+            "capacity_curve": [
+                {"t_air_eff_c": 25.0, "q_cap_kw": 400.0},
+                {"t_air_eff_c": 35.0},
+            ]
+        }
+
+    if not mutate_and_reject(mut_curve_bad_point, "S4 curve point missing q"):
         all_ok = False
 
     # Every required numeric field must preserve the input contract, even when
@@ -349,10 +479,13 @@ try:
                 if not mutate_and_reject(mut_bad_number, f"T invalid {side}.{key} {kind}"):
                     all_ok = False
 
-    # Anti-cheat: source must mention recirculation path, not BMS-only
+    # Anti-cheat: source must mention recirculation + curve path, not BMS-only
     src = SRC_PATH.read_text(encoding="utf-8")
     if "recirc_ratio" not in src:
         print("FAIL: source does not reference recirc_ratio")
+        all_ok = False
+    if "capacity_curve" not in src:
+        print("FAIL: source does not reference capacity_curve")
         all_ok = False
     if "bms_duty_kw" in src and "recirc_ratio" not in src:
         print("FAIL: source still looks like BMS-only path without recirculation")
