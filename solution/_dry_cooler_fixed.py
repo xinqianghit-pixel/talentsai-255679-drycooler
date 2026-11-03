@@ -111,8 +111,41 @@ def allocate_flows(
     return out
 
 
+def estimate_plume_gain(raw: object, rows: list[list[float]]) -> float:
+    """Scalar least-squares fit: observed-tamb = gain * sum_j r_ij*(tdisch_j-tamb)."""
+    n = len(rows)
+    if not isinstance(raw, list) or len(raw) < 2:
+        raise ValueError("plume_calibration must contain at least 2 samples")
+    sum_xx = 0.0
+    sum_xy = 0.0
+    for k, sample in enumerate(raw):
+        if not isinstance(sample, dict):
+            raise ValueError(f"plume_calibration[{k}] must be object")
+        for field in ("ambient_c", "discharge_c", "observed_inlet_c"):
+            if field not in sample:
+                raise ValueError(f"plume_calibration[{k}] missing {field}")
+        ambient = require_finite(f"plume_calibration[{k}].ambient_c", sample["ambient_c"])
+        discharge = sample["discharge_c"]
+        observed = sample["observed_inlet_c"]
+        if not isinstance(discharge, list) or not isinstance(observed, list) or len(discharge) != n or len(observed) != n:
+            raise ValueError(f"plume_calibration[{k}] vector length mismatch")
+        discharge = [require_finite(f"plume_calibration[{k}].discharge_c[{j}]", v) for j, v in enumerate(discharge)]
+        observed = [require_finite(f"plume_calibration[{k}].observed_inlet_c[{i}]", v) for i, v in enumerate(observed)]
+        for i, row in enumerate(rows):
+            x = sum(row[j] * (discharge[j] - ambient) for j in range(n))
+            y = observed[i] - ambient
+            sum_xx += x * x
+            sum_xy += x * y
+    if not math.isfinite(sum_xx) or sum_xx <= 1e-12:
+        raise ValueError("plume calibration is rank deficient")
+    gain = sum_xy / sum_xx
+    if not math.isfinite(gain) or gain <= 0.0:
+        raise ValueError("estimated plume gain must be positive")
+    return gain
+
+
 def compute(s: dict, np: dict) -> dict:
-    for key in ("tamb_c", "glycol_total_kg_s", "pump_shutoff_head_kpa", "cp_j_per_kg_k", "air_cp_j_per_kg_k", "recirc_matrix", "units"):
+    for key in ("tamb_c", "glycol_total_kg_s", "pump_shutoff_head_kpa", "cp_j_per_kg_k", "air_cp_j_per_kg_k", "recirc_matrix", "plume_calibration", "units"):
         if key not in s:
             raise ValueError(f"missing sensor field: {key}")
     if "design_approach_k" not in np or "models" not in np:
@@ -206,6 +239,10 @@ def compute(s: dict, np: dict) -> dict:
             raise ValueError(f"recirc_matrix[{i}] row sum must be strictly < 1")
         rows.append(vals)
 
+    plume_gain = estimate_plume_gain(s["plume_calibration"], rows)
+    if any(plume_gain * sum(row) >= 1.0 - 1e-12 for row in rows):
+        raise ValueError("estimated plume gain makes effective recirculation row sum >= 1")
+
     flows = allocate_flows(total, shutoff_head, weights, resistances, caps)
 
     # Shot A: discharge temperatures are coupled to rejected heat.  The measured
@@ -216,8 +253,9 @@ def compute(s: dict, np: dict) -> dict:
         q_all = []
         target_discharge = []
         for i in range(n):
-            row_sum = sum(rows[i])
-            t_eff = (1.0 - row_sum) * tamb + sum(rows[i][j] * discharge[j] for j in range(n))
+            effective_row = [plume_gain * value for value in rows[i]]
+            row_sum = sum(effective_row)
+            t_eff = (1.0 - row_sum) * tamb + sum(effective_row[j] * discharge[j] for j in range(n))
             dT = fluid_in[i] - t_eff - approach
             if dT <= 0.0:
                 raise ValueError(f"unit {ids[i]} non-positive available temperature difference")

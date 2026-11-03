@@ -84,6 +84,23 @@ def allocate_flows(zero_head_flow, shutoff_head, openings, resistances, caps):
     return flows_at((lo + hi) * 0.5)
 
 
+def estimate_gain(calibration, matrix):
+    n = len(matrix)
+    xx = 0.0
+    xy = 0.0
+    for sample in calibration:
+        ambient = float(sample["ambient_c"])
+        discharge = [float(v) for v in sample["discharge_c"]]
+        observed = [float(v) for v in sample["observed_inlet_c"]]
+        for i in range(n):
+            x = sum(float(matrix[i][j]) * (discharge[j] - ambient) for j in range(n))
+            xx += x * x
+            xy += x * (observed[i] - ambient)
+    if xx <= 1e-12:
+        raise ValueError("rank deficient calibration")
+    return xy / xx
+
+
 def expected_from(s: dict, np: dict) -> dict:
     tamb = float(s["tamb_c"])
     total = float(s["glycol_total_kg_s"])
@@ -98,6 +115,7 @@ def expected_from(s: dict, np: dict) -> dict:
     n = len(units)
     matrix = s["recirc_matrix"]
     tdisch = [float(u["tdisch_c"]) for u in units]
+    plume_gain = estimate_gain(s["plume_calibration"], matrix)
     fluid_in = [float(u["fluid_in_c"]) for u in units]
     weights = [float(u["valve_weight"]) for u in units]
     caps = [float(u["max_flow_kg_s"]) for u in units]
@@ -108,7 +126,7 @@ def expected_from(s: dict, np: dict) -> dict:
     for _ in range(MAX_COUPLED_ITERS):
         t_eff_all, q_all, target = [], [], []
         for i, u in enumerate(units):
-            row = [float(x) for x in matrix[i]]
+            row = [plume_gain * float(x) for x in matrix[i]]
             t_eff = (1.0 - sum(row)) * tamb + sum(row[j] * discharge[j] for j in range(n))
             dT = fluid_in[i] - t_eff - approach
             q_gly = flows[i] * cp * dT / 1000.0
@@ -396,7 +414,7 @@ try:
     # Left clamp: force very low t_eff via low tamb + zero matrix
     def mut_left_clamp(s, np):
         n = len(s["units"])
-        s = s | {"tamb_c": 20.0, "recirc_matrix": [[0.0] * n for _ in range(n)]}
+        s = s | {"tamb_c": 20.0, "recirc_matrix": [[1e-6 * float(v) for v in row] for row in s["recirc_matrix"]]}
         return s, np
 
     if not mutate_and_check(mut_left_clamp, "K curve left clamp"):
@@ -408,7 +426,7 @@ try:
         n = len(s["units"])
         s = copy.deepcopy(s)
         s["tamb_c"] = 45.0
-        s["recirc_matrix"] = [[0.0] * n for _ in range(n)]
+        s["recirc_matrix"] = [[1e-6 * float(v) for v in row] for row in s["recirc_matrix"]]
         for u in s["units"]:
             u["fluid_in_c"] = 55.0
         return s, np
@@ -431,6 +449,17 @@ try:
     ):
         all_ok = False
 
+    # Calibration observations drive the inferred plume gain.
+    def mut_calibration_gain(s, np):
+        s = copy.deepcopy(s)
+        for sample in s["plume_calibration"]:
+            ambient = sample["ambient_c"]
+            sample["observed_inlet_c"] = [ambient + 0.72 * (value - ambient) / 1.15 for value in sample["observed_inlet_c"]]
+        return s, np
+
+    if not mutate_and_check(mut_calibration_gain, "M inferred plume gain"):
+        all_ok = False
+
     # Rejects
     if not mutate_and_reject(lambda s, np: (s | {"glycol_total_kg_s": 0.0}, np), "R zero total"):
         all_ok = False
@@ -443,6 +472,17 @@ try:
         return s, np
 
     if not mutate_and_reject(mut_bad_resistance, "R2b zero branch resistance"):
+        all_ok = False
+
+    def mut_rank_deficient_calibration(s, np):
+        s = copy.deepcopy(s)
+        for sample in s["plume_calibration"]:
+            ambient = sample["ambient_c"]
+            sample["discharge_c"] = [ambient] * len(s["units"])
+            sample["observed_inlet_c"] = [ambient] * len(s["units"])
+        return s, np
+
+    if not mutate_and_reject(mut_rank_deficient_calibration, "R2c rank deficient calibration"):
         all_ok = False
 
     def mut_row_sum(s, np):

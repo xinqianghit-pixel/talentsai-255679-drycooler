@@ -58,6 +58,60 @@
       "branch_resistance_kpa_per_kg_s2": 0.42
     }
   ],
-  "comment": "asymmetric plume cross-recirc; station glycol shared; bms_duty_kw lagged",
-  "pump_shutoff_head_kpa": 180.0
+  "comment": "asymmetric plume cross-recirc; plume gain inferred from deterministic calibration; shared pump hydraulics",
+  "pump_shutoff_head_kpa": 180.0,
+  "plume_calibration": [
+    {
+      "ambient_c": 31.0,
+      "discharge_c": [
+        39.0,
+        42.0,
+        40.0
+      ],
+      "observed_inlet_c": [
+        33.2425,
+        33.415,
+        33.254
+      ]
+    },
+    {
+      "ambient_c": 34.5,
+      "discharge_c": [
+        44.0,
+        41.0,
+        46.0
+      ],
+      "observed_inlet_c": [
+        36.455,
+        37.46125,
+        36.271
+      ]
+    },
+    {
+      "ambient_c": 28.0,
+      "discharge_c": [
+        36.0,
+        38.0,
+        35.0
+      ],
+      "observed_inlet_c": [
+        30.0125,
+        30.185,
+        30.116
+      ]
+    },
+    {
+      "ambient_c": 37.0,
+      "discharge_c": [
+        48.0,
+        45.0,
+        50.0
+      ],
+      "observed_inlet_c": [
+        39.3,
+        40.3925,
+        39.116
+      ]
+    }
+  ]
 }
