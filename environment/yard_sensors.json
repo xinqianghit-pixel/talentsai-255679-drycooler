@@ -2,6 +2,7 @@
   "tamb_c": 33.2,
   "glycol_total_kg_s": 60.0,
   "cp_j_per_kg_k": 3650.0,
+  "air_cp_j_per_kg_k": 1006.0,
   "recirc_matrix": [
     [0.05, 0.10, 0.05],
     [0.15, 0.00, 0.10],
@@ -11,6 +12,7 @@
     {
       "id": "A",
       "tdisch_c": 41.8,
+      "air_mass_flow_kg_s": 48.0,
       "fluid_in_c": 44.6,
       "valve_weight": 1.0,
       "max_flow_kg_s": 25.0,
@@ -21,6 +23,7 @@
     {
       "id": "B",
       "tdisch_c": 40.0,
+      "air_mass_flow_kg_s": 41.0,
       "fluid_in_c": 45.0,
       "valve_weight": 1.0,
       "max_flow_kg_s": 22.0,
@@ -31,6 +34,7 @@
     {
       "id": "C",
       "tdisch_c": 42.5,
+      "air_mass_flow_kg_s": 46.0,
       "fluid_in_c": 46.0,
       "valve_weight": 0.5,
       "max_flow_kg_s": 18.0,

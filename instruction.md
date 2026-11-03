@@ -23,9 +23,11 @@ python3 /app/dry_cooler_cap.py
 - `tamb_c`：环境干球（°C）
 - `glycol_total_kg_s`：站级乙二醇总质量流量（kg/s），必须为正有限数
 - `cp_j_per_kg_k`：乙二醇比热（J/(kg·K)），必须为正有限数
+- `air_cp_j_per_kg_k`：空气定压比热（J/(kg·K)），必须为正有限数
 - `units`：长度 \(N\ge 2\) 的数组；每个单元对象含：
   - `id`：非空字符串，全局唯一
   - `tdisch_c`、`fluid_in_c`：有限数
+  - `air_mass_flow_kg_s`：单机空气质量流量（kg/s），必须为正有限数
   - `valve_weight`：有限数且 \(\ge 0\)
   - `max_flow_kg_s`：正有限数
   - `model_id`：字符串，必须能在铭牌 `models` 中找到
@@ -38,7 +40,7 @@ python3 /app/dry_cooler_cap.py
 
 `twb_c`、`bms_duty_kw`、`fluid_out_c`、机型 `design_capacity_kw` 等为干扰字段，不得单独充当能力结果。
 
-### 有效进风
+### 有效进风与羽流热平衡（隐式耦合）
 
 对单元 i：
 
@@ -46,7 +48,13 @@ python3 /app/dry_cooler_cap.py
 t_{\mathrm{eff},i}=(1-\sum_j r_{ij})\,T_{\mathrm{amb}}+\sum_j r_{ij}\,T_{\mathrm{disch},j}
 \]
 
-其中 \(r_{ij}=\)`recirc_matrix[i][j]`。不要用湿球。
+其中 \(r_{ij}=\)`recirc_matrix[i][j]`。不要用湿球。输入 `tdisch_c` 只作为迭代初值；最终排风温度必须与本轮排热量自洽：
+
+\[
+T_{\mathrm{disch},i}=t_{\mathrm{eff},i}+\frac{1000q_{\mathrm{avail},i}}{\dot m_{\mathrm{air},i}c_{p,\mathrm{air}}}
+\]
+
+因此有效进风、单机能力与排风温度构成非线性固定点。按输入 `tdisch_c` 初始化，使用阻尼迭代：每轮先由旧排风温度同时计算全部 `t_eff` 与 `q_avail`，再令 `tdisch_new = 0.5*tdisch_target + 0.5*tdisch_old`。当所有单机新旧排风温度最大绝对差不超过 `1e-8 °C` 时收敛，最多 200 轮；超限须报错。最终输出使用收敛轮计算出的 `t_eff` 与 `q_avail`。
 
 ### 共享流量主动集分配
 

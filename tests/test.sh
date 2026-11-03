@@ -19,6 +19,9 @@ SRC_PATH = Path("/app/dry_cooler_cap.py")
 TOLERANCE = 0.001
 FLOW_TOL = 1e-9
 MAX_FLOW_ITERS = 64
+MAX_COUPLED_ITERS = 200
+COUPLED_TOL = 1e-8
+COUPLED_DAMPING = 0.5
 
 
 def write_reward(value: float) -> None:
@@ -97,6 +100,7 @@ def expected_from(s: dict, np: dict) -> dict:
     tamb = float(s["tamb_c"])
     total = float(s["glycol_total_kg_s"])
     cp = float(s["cp_j_per_kg_k"])
+    air_cp = float(s["air_cp_j_per_kg_k"])
     approach = float(np["design_approach_k"])
     models = {
         mid: parse_capacity_curve(m["capacity_curve"]) for mid, m in np["models"].items()
@@ -109,25 +113,33 @@ def expected_from(s: dict, np: dict) -> dict:
     weights = [float(u["valve_weight"]) for u in units]
     caps = [float(u["max_flow_kg_s"]) for u in units]
     flows = allocate_flows(total, weights, caps)
+    air_flows = [float(u["air_mass_flow_kg_s"]) for u in units]
+    discharge = list(tdisch)
+    for _ in range(MAX_COUPLED_ITERS):
+        t_eff_all, q_all, target = [], [], []
+        for i, u in enumerate(units):
+            row = [float(x) for x in matrix[i]]
+            t_eff = (1.0 - sum(row)) * tamb + sum(row[j] * discharge[j] for j in range(n))
+            dT = fluid_in[i] - t_eff - approach
+            q_gly = flows[i] * cp * dT / 1000.0
+            q_curve = interpolate_capacity(models[u["model_id"]], t_eff)
+            q = min(q_gly, q_curve)
+            t_eff_all.append(t_eff)
+            q_all.append(q)
+            target.append(t_eff + q * 1000.0 / (air_flows[i] * air_cp))
+        updated = [COUPLED_DAMPING * target[i] + (1.0 - COUPLED_DAMPING) * discharge[i] for i in range(n)]
+        if max(abs(updated[i] - discharge[i]) for i in range(n)) <= COUPLED_TOL:
+            discharge = updated
+            break
+        discharge = updated
+    else:
+        raise ValueError("coupled plume balance did not converge")
     out_units = []
     q_site = 0.0
     for i, u in enumerate(units):
-        row = [float(x) for x in matrix[i]]
-        row_sum = sum(row)
-        t_eff = (1.0 - row_sum) * tamb + sum(row[j] * tdisch[j] for j in range(n))
-        dT = fluid_in[i] - t_eff - approach
-        q_gly = flows[i] * cp * dT / 1000.0
-        q_curve = interpolate_capacity(models[u["model_id"]], t_eff)
-        q_avail = min(q_gly, q_curve)
+        t_eff, q_avail = t_eff_all[i], q_all[i]
         q_site += q_avail
-        out_units.append(
-            {
-                "id": u["id"],
-                "t_air_eff_c": round(t_eff, 2),
-                "flow_kg_s": round(flows[i], 2),
-                "q_avail_kw": round(q_avail, 2),
-            }
-        )
+        out_units.append({"id": u["id"], "t_air_eff_c": round(t_eff, 2), "flow_kg_s": round(flows[i], 2), "q_avail_kw": round(q_avail, 2)})
     return {"q_site_kw": round(q_site, 2), "units": out_units}
 
 
@@ -487,7 +499,7 @@ try:
     if not mutate_and_reject(mut_curve_one, "R9 curve <2"):
         all_ok = False
 
-    for key in ("tamb_c", "glycol_total_kg_s", "cp_j_per_kg_k"):
+    for key in ("tamb_c", "glycol_total_kg_s", "cp_j_per_kg_k", "air_cp_j_per_kg_k"):
         for kind, value in (("NaN", float("nan")), ("bool", True), ("null", None), ("str", "1.0")):
             def mut(s, np, key=key, value=value):
                 s = copy.deepcopy(s)

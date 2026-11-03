@@ -13,6 +13,9 @@ SENSORS = Path("/app/yard_sensors.json")
 NAMEPLATE = Path("/app/nameplate.json")
 FLOW_TOL = 1e-9
 MAX_FLOW_ITERS = 64
+MAX_COUPLED_ITERS = 200
+COUPLED_TOL = 1e-8
+COUPLED_DAMPING = 0.5
 
 
 def load_json(path: Path) -> dict:
@@ -113,7 +116,7 @@ def allocate_flows(
 
 
 def compute(s: dict, np: dict) -> dict:
-    for key in ("tamb_c", "glycol_total_kg_s", "cp_j_per_kg_k", "recirc_matrix", "units"):
+    for key in ("tamb_c", "glycol_total_kg_s", "cp_j_per_kg_k", "air_cp_j_per_kg_k", "recirc_matrix", "units"):
         if key not in s:
             raise ValueError(f"missing sensor field: {key}")
     if "design_approach_k" not in np or "models" not in np:
@@ -122,11 +125,14 @@ def compute(s: dict, np: dict) -> dict:
     tamb = require_finite("tamb_c", s["tamb_c"])
     total = require_finite("glycol_total_kg_s", s["glycol_total_kg_s"])
     cp = require_finite("cp_j_per_kg_k", s["cp_j_per_kg_k"])
+    air_cp = require_finite("air_cp_j_per_kg_k", s["air_cp_j_per_kg_k"])
     approach = require_finite("design_approach_k", np["design_approach_k"])
     if total <= 0.0:
         raise ValueError("glycol_total_kg_s must be positive")
     if cp <= 0.0:
         raise ValueError("cp_j_per_kg_k must be positive")
+    if air_cp <= 0.0:
+        raise ValueError("air_cp_j_per_kg_k must be positive")
 
     models_raw = np["models"]
     if not isinstance(models_raw, dict) or not models_raw:
@@ -147,11 +153,12 @@ def compute(s: dict, np: dict) -> dict:
     weights: list[float] = []
     caps: list[float] = []
     model_ids: list[str] = []
+    air_flows: list[float] = []
     seen: set[str] = set()
     for i, u in enumerate(units_raw):
         if not isinstance(u, dict):
             raise ValueError(f"units[{i}] must be object")
-        for k in ("id", "tdisch_c", "fluid_in_c", "valve_weight", "max_flow_kg_s", "model_id"):
+        for k in ("id", "tdisch_c", "air_mass_flow_kg_s", "fluid_in_c", "valve_weight", "max_flow_kg_s", "model_id"):
             if k not in u:
                 raise ValueError(f"units[{i}] missing {k}")
         uid = u["id"]
@@ -175,6 +182,10 @@ def compute(s: dict, np: dict) -> dict:
         weights.append(w)
         caps.append(cap)
         model_ids.append(mid)
+        air_flow = require_finite(f"units[{i}].air_mass_flow_kg_s", u["air_mass_flow_kg_s"])
+        if air_flow <= 0.0:
+            raise ValueError(f"units[{i}].air_mass_flow_kg_s must be positive")
+        air_flows.append(air_flow)
 
     matrix = s["recirc_matrix"]
     if not isinstance(matrix, list) or len(matrix) != n:
@@ -193,17 +204,38 @@ def compute(s: dict, np: dict) -> dict:
 
     flows = allocate_flows(total, weights, caps)
 
+    # Shot A: discharge temperatures are coupled to rejected heat.  The measured
+    # values are only the initial iterate; solve the plume/heat balance to a fixed point.
+    discharge = list(tdisch)
+    for _ in range(MAX_COUPLED_ITERS):
+        t_eff_all = []
+        q_all = []
+        target_discharge = []
+        for i in range(n):
+            row_sum = sum(rows[i])
+            t_eff = (1.0 - row_sum) * tamb + sum(rows[i][j] * discharge[j] for j in range(n))
+            dT = fluid_in[i] - t_eff - approach
+            if dT <= 0.0:
+                raise ValueError(f"unit {ids[i]} non-positive available temperature difference")
+            q_gly = flows[i] * cp * dT / 1000.0
+            q_curve = interpolate_capacity(models[model_ids[i]], t_eff)
+            q_avail = min(q_gly, q_curve)
+            t_eff_all.append(t_eff)
+            q_all.append(q_avail)
+            target_discharge.append(t_eff + q_avail * 1000.0 / (air_flows[i] * air_cp))
+        updated = [COUPLED_DAMPING * target_discharge[i] + (1.0 - COUPLED_DAMPING) * discharge[i] for i in range(n)]
+        if max(abs(updated[i] - discharge[i]) for i in range(n)) <= COUPLED_TOL:
+            discharge = updated
+            break
+        discharge = updated
+    else:
+        raise ValueError("coupled plume balance did not converge")
+
     unit_out = []
     q_site = 0.0
     for i in range(n):
-        row_sum = sum(rows[i])
-        t_eff = (1.0 - row_sum) * tamb + sum(rows[i][j] * tdisch[j] for j in range(n))
-        dT = fluid_in[i] - t_eff - approach
-        if dT <= 0.0:
-            raise ValueError(f"unit {ids[i]} non-positive available temperature difference")
-        q_gly = flows[i] * cp * dT / 1000.0
-        q_curve = interpolate_capacity(models[model_ids[i]], t_eff)
-        q_avail = min(q_gly, q_curve)
+        t_eff = t_eff_all[i]
+        q_avail = q_all[i]
         if not all(math.isfinite(x) for x in (t_eff, flows[i], q_avail)):
             raise ValueError(f"unit {ids[i]} produced non-finite output")
         q_site += q_avail
