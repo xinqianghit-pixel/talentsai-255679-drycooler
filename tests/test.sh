@@ -1,5 +1,5 @@
 #!/bin/bash
-# Harbor verifier: multi-unit dry-cooler cross-recirc + shared glycol active-set
+# Harbor verifier: multi-unit dry-cooler cross-recirc + shared pump/branch hydraulic root
 REWARD_FILE="/logs/verifier/reward.json"
 mkdir -p /logs/verifier
 echo '{"reward": 0}' > "$REWARD_FILE"
@@ -68,37 +68,26 @@ def interpolate_capacity(points, t_eff: float) -> float:
     raise ValueError("interp fail")
 
 
-def allocate_flows(total: float, weights: list[float], caps: list[float]) -> list[float]:
-    n = len(weights)
-    remaining = float(total)
-    out = [0.0] * n
-    active = {i for i in range(n) if weights[i] > 0.0 and caps[i] > 0.0}
-    for _ in range(MAX_FLOW_ITERS):
-        if remaining <= FLOW_TOL or not active:
-            break
-        wsum = sum(weights[i] for i in active)
-        if wsum <= 0.0:
-            break
-        provisional = {i: remaining * (weights[i] / wsum) for i in active}
-        saturated = [
-            i for i, share in provisional.items() if share >= (caps[i] - out[i]) - FLOW_TOL
-        ]
-        if saturated:
-            for i in saturated:
-                out[i] = caps[i]
-                active.discard(i)
-            remaining = total - sum(out)
-            continue
-        for i, share in provisional.items():
-            out[i] += share
-        remaining = 0.0
-        break
-    return out
+def allocate_flows(zero_head_flow, shutoff_head, openings, resistances, caps):
+    def flows_at(h):
+        return [0.0 if openings[i] == 0.0 else min(caps[i], openings[i] * math.sqrt(h / resistances[i])) for i in range(len(openings))]
+    def f(h):
+        q = sum(flows_at(h))
+        return h - shutoff_head * (1.0 - (q / zero_head_flow) ** 2)
+    lo, hi = 0.0, shutoff_head
+    for _ in range(200):
+        mid = (lo + hi) * 0.5
+        if f(mid) < 0.0:
+            lo = mid
+        else:
+            hi = mid
+    return flows_at((lo + hi) * 0.5)
 
 
 def expected_from(s: dict, np: dict) -> dict:
     tamb = float(s["tamb_c"])
     total = float(s["glycol_total_kg_s"])
+    shutoff_head = float(s["pump_shutoff_head_kpa"])
     cp = float(s["cp_j_per_kg_k"])
     air_cp = float(s["air_cp_j_per_kg_k"])
     approach = float(np["design_approach_k"])
@@ -112,7 +101,8 @@ def expected_from(s: dict, np: dict) -> dict:
     fluid_in = [float(u["fluid_in_c"]) for u in units]
     weights = [float(u["valve_weight"]) for u in units]
     caps = [float(u["max_flow_kg_s"]) for u in units]
-    flows = allocate_flows(total, weights, caps)
+    resistances = [float(u["branch_resistance_kpa_per_kg_s2"]) for u in units]
+    flows = allocate_flows(total, shutoff_head, weights, resistances, caps)
     air_flows = [float(u["air_mass_flow_kg_s"]) for u in units]
     discharge = list(tdisch)
     for _ in range(MAX_COUPLED_ITERS):
@@ -292,7 +282,7 @@ try:
     else:
         print("PASS [A baseline]")
 
-    # Wrong paths that ignore matrix / active-set / curve
+    # Wrong paths that ignore matrix / hydraulics / curve
     if got0 is not None:
         wrong_equal = copy.deepcopy(exp0)
         n = len(s0["units"])
@@ -317,7 +307,7 @@ try:
     if not mutate_and_check(mut_transpose, "B matrix transpose"):
         all_ok = False
 
-    # Active-set: tighten B cap so redistribution is forced differently
+    # Hydraulic cap: tighten B cap so the common-head root redistributes flow
     if not mutate_and_check(
         lambda s, np: (
             s
@@ -329,7 +319,15 @@ try:
             },
             np,
         ),
-        "C active-set retighten B",
+        "C hydraulic cap retighten B",
+    ):
+        all_ok = False
+
+    if not mutate_and_check(lambda s, np: (s | {"pump_shutoff_head_kpa": 125.0}, np), "C2 pump head"):
+        all_ok = False
+    if not mutate_and_check(
+        lambda s, np: (s | {"units": [u | ({"branch_resistance_kpa_per_kg_s2": 0.75} if u["id"] == "C" else {}) for u in s["units"]]}, np),
+        "C3 branch resistance C",
     ):
         all_ok = False
 
@@ -439,6 +437,14 @@ try:
     if not mutate_and_reject(lambda s, np: (s | {"cp_j_per_kg_k": -1.0}, np), "R2 neg cp"):
         all_ok = False
 
+    def mut_bad_resistance(s, np):
+        s = copy.deepcopy(s)
+        s["units"][0]["branch_resistance_kpa_per_kg_s2"] = 0.0
+        return s, np
+
+    if not mutate_and_reject(mut_bad_resistance, "R2b zero branch resistance"):
+        all_ok = False
+
     def mut_row_sum(s, np):
         s = copy.deepcopy(s)
         s["recirc_matrix"][0] = [0.5, 0.5, 0.1]
@@ -499,7 +505,7 @@ try:
     if not mutate_and_reject(mut_curve_one, "R9 curve <2"):
         all_ok = False
 
-    for key in ("tamb_c", "glycol_total_kg_s", "cp_j_per_kg_k", "air_cp_j_per_kg_k"):
+    for key in ("tamb_c", "glycol_total_kg_s", "pump_shutoff_head_kpa", "cp_j_per_kg_k", "air_cp_j_per_kg_k"):
         for kind, value in (("NaN", float("nan")), ("bool", True), ("null", None), ("str", "1.0")):
             def mut(s, np, key=key, value=value):
                 s = copy.deepcopy(s)

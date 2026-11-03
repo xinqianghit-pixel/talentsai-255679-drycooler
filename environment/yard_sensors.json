@@ -4,9 +4,21 @@
   "cp_j_per_kg_k": 3650.0,
   "air_cp_j_per_kg_k": 1006.0,
   "recirc_matrix": [
-    [0.05, 0.10, 0.05],
-    [0.15, 0.00, 0.10],
-    [0.08, 0.12, 0.00]
+    [
+      0.05,
+      0.1,
+      0.05
+    ],
+    [
+      0.15,
+      0.0,
+      0.1
+    ],
+    [
+      0.08,
+      0.12,
+      0.0
+    ]
   ],
   "units": [
     {
@@ -18,7 +30,8 @@
       "max_flow_kg_s": 25.0,
       "model_id": "DC-X480",
       "twb_c": 26.5,
-      "bms_duty_kw": 512.0
+      "bms_duty_kw": 512.0,
+      "branch_resistance_kpa_per_kg_s2": 0.24
     },
     {
       "id": "B",
@@ -29,7 +42,8 @@
       "max_flow_kg_s": 22.0,
       "model_id": "DC-Y300",
       "twb_c": 25.1,
-      "bms_duty_kw": 480.0
+      "bms_duty_kw": 480.0,
+      "branch_resistance_kpa_per_kg_s2": 0.31
     },
     {
       "id": "C",
@@ -40,8 +54,10 @@
       "max_flow_kg_s": 18.0,
       "model_id": "DC-X480",
       "fluid_out_c": 39.0,
-      "bms_duty_kw": 390.0
+      "bms_duty_kw": 390.0,
+      "branch_resistance_kpa_per_kg_s2": 0.42
     }
   ],
-  "comment": "asymmetric plume cross-recirc; station glycol shared; bms_duty_kw lagged"
+  "comment": "asymmetric plume cross-recirc; station glycol shared; bms_duty_kw lagged",
+  "pump_shutoff_head_kpa": 180.0
 }

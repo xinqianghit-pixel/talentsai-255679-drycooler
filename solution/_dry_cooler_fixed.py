@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference fix: multi-unit dry-cooler with cross-recirc matrix + shared glycol active-set."""
+"""Reference fix: multi-unit dry-cooler with cross-recirc matrix + shared pump/branch hydraulic root."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 SENSORS = Path("/app/yard_sensors.json")
 NAMEPLATE = Path("/app/nameplate.json")
 FLOW_TOL = 1e-9
-MAX_FLOW_ITERS = 64
+MAX_FLOW_ITERS = 160
 MAX_COUPLED_ITERS = 200
 COUPLED_TOL = 1e-8
 COUPLED_DAMPING = 0.5
@@ -68,55 +68,51 @@ def interpolate_capacity(points: list[tuple[float, float]], t_eff: float) -> flo
 
 
 def allocate_flows(
-    total: float,
-    weights: list[float],
+    zero_head_flow: float,
+    shutoff_head: float,
+    openings: list[float],
+    resistances: list[float],
     caps: list[float],
 ) -> list[float]:
-    n = len(weights)
-    if n == 0:
-        raise ValueError("no units")
-    if total <= 0.0:
-        raise ValueError("glycol_total_kg_s must be positive")
-    remaining = float(total)
-    out = [0.0] * n
-    active = {i for i in range(n) if weights[i] > 0.0 and caps[i] > 0.0}
-    for _ in range(MAX_FLOW_ITERS):
-        if remaining <= FLOW_TOL or not active:
-            break
-        wsum = sum(weights[i] for i in active)
-        if wsum <= 0.0:
-            break
-        provisional = {i: remaining * (weights[i] / wsum) for i in active}
-        saturated = [
-            i
-            for i, share in provisional.items()
-            if share >= (caps[i] - out[i]) - FLOW_TOL
+    """Solve common head H = H0*(1-(sum(q_i)/Q0)^2) by bisection.
+
+    Each branch has q_i(H)=min(cap_i, opening_i*sqrt(H/K_i)).
+    The residual is strictly increasing on [0,H0], hence the root is unique.
+    """
+    if zero_head_flow <= 0.0 or shutoff_head <= 0.0:
+        raise ValueError("pump parameters must be positive")
+
+    def branch_flows(head: float) -> list[float]:
+        return [
+            0.0 if openings[i] == 0.0 else min(caps[i], openings[i] * math.sqrt(head / resistances[i]))
+            for i in range(len(openings))
         ]
-        if saturated:
-            for i in saturated:
-                out[i] = caps[i]
-                active.discard(i)
-            remaining = total - sum(out)
-            continue
-        for i, share in provisional.items():
-            out[i] += share
-        remaining = 0.0
-        break
+
+    def residual(head: float) -> float:
+        q_total = sum(branch_flows(head))
+        return head - shutoff_head * (1.0 - (q_total / zero_head_flow) ** 2)
+
+    lo, hi = 0.0, shutoff_head
+    if residual(lo) > 0.0 or residual(hi) < 0.0:
+        raise ValueError("pump/branch root is not bracketed")
+    for _ in range(MAX_FLOW_ITERS):
+        mid = (lo + hi) / 2.0
+        if residual(mid) > 0.0:
+            hi = mid
+        else:
+            lo = mid
+        if hi - lo <= FLOW_TOL:
+            break
     else:
-        raise ValueError("flow allocation did not converge")
-    # numerical cleanup
-    for i in range(n):
-        if out[i] < 0.0:
-            raise ValueError("negative allocated flow")
-        if out[i] > caps[i] + 1e-6:
-            raise ValueError("allocated flow exceeds cap")
-    if sum(out) - total > 1e-6:
-        raise ValueError("allocated flow exceeds station total")
+        raise ValueError("pump/branch root did not converge")
+    out = branch_flows((lo + hi) / 2.0)
+    if not all(math.isfinite(q) and 0.0 <= q <= caps[i] + 1e-8 for i, q in enumerate(out)):
+        raise ValueError("invalid branch flow")
     return out
 
 
 def compute(s: dict, np: dict) -> dict:
-    for key in ("tamb_c", "glycol_total_kg_s", "cp_j_per_kg_k", "air_cp_j_per_kg_k", "recirc_matrix", "units"):
+    for key in ("tamb_c", "glycol_total_kg_s", "pump_shutoff_head_kpa", "cp_j_per_kg_k", "air_cp_j_per_kg_k", "recirc_matrix", "units"):
         if key not in s:
             raise ValueError(f"missing sensor field: {key}")
     if "design_approach_k" not in np or "models" not in np:
@@ -124,11 +120,14 @@ def compute(s: dict, np: dict) -> dict:
 
     tamb = require_finite("tamb_c", s["tamb_c"])
     total = require_finite("glycol_total_kg_s", s["glycol_total_kg_s"])
+    shutoff_head = require_finite("pump_shutoff_head_kpa", s["pump_shutoff_head_kpa"])
     cp = require_finite("cp_j_per_kg_k", s["cp_j_per_kg_k"])
     air_cp = require_finite("air_cp_j_per_kg_k", s["air_cp_j_per_kg_k"])
     approach = require_finite("design_approach_k", np["design_approach_k"])
     if total <= 0.0:
         raise ValueError("glycol_total_kg_s must be positive")
+    if shutoff_head <= 0.0:
+        raise ValueError("pump_shutoff_head_kpa must be positive")
     if cp <= 0.0:
         raise ValueError("cp_j_per_kg_k must be positive")
     if air_cp <= 0.0:
@@ -153,12 +152,13 @@ def compute(s: dict, np: dict) -> dict:
     weights: list[float] = []
     caps: list[float] = []
     model_ids: list[str] = []
+    resistances: list[float] = []
     air_flows: list[float] = []
     seen: set[str] = set()
     for i, u in enumerate(units_raw):
         if not isinstance(u, dict):
             raise ValueError(f"units[{i}] must be object")
-        for k in ("id", "tdisch_c", "air_mass_flow_kg_s", "fluid_in_c", "valve_weight", "max_flow_kg_s", "model_id"):
+        for k in ("id", "tdisch_c", "air_mass_flow_kg_s", "fluid_in_c", "valve_weight", "max_flow_kg_s", "branch_resistance_kpa_per_kg_s2", "model_id"):
             if k not in u:
                 raise ValueError(f"units[{i}] missing {k}")
         uid = u["id"]
@@ -172,8 +172,11 @@ def compute(s: dict, np: dict) -> dict:
             raise ValueError(f"units[{i}] unknown model_id")
         w = require_finite(f"units[{i}].valve_weight", u["valve_weight"])
         cap = require_finite(f"units[{i}].max_flow_kg_s", u["max_flow_kg_s"])
+        resistance = require_finite(f"units[{i}].branch_resistance_kpa_per_kg_s2", u["branch_resistance_kpa_per_kg_s2"])
         if w < 0.0:
             raise ValueError(f"units[{i}].valve_weight must be >= 0")
+        if resistance <= 0.0:
+            raise ValueError(f"units[{i}].branch_resistance_kpa_per_kg_s2 must be positive")
         if cap <= 0.0:
             raise ValueError(f"units[{i}].max_flow_kg_s must be positive")
         ids.append(uid)
@@ -182,6 +185,7 @@ def compute(s: dict, np: dict) -> dict:
         weights.append(w)
         caps.append(cap)
         model_ids.append(mid)
+        resistances.append(resistance)
         air_flow = require_finite(f"units[{i}].air_mass_flow_kg_s", u["air_mass_flow_kg_s"])
         if air_flow <= 0.0:
             raise ValueError(f"units[{i}].air_mass_flow_kg_s must be positive")
@@ -202,7 +206,7 @@ def compute(s: dict, np: dict) -> dict:
             raise ValueError(f"recirc_matrix[{i}] row sum must be strictly < 1")
         rows.append(vals)
 
-    flows = allocate_flows(total, weights, caps)
+    flows = allocate_flows(total, shutoff_head, weights, resistances, caps)
 
     # Shot A: discharge temperatures are coupled to rejected heat.  The measured
     # values are only the initial iterate; solve the plume/heat balance to a fixed point.
